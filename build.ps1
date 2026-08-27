@@ -25,7 +25,7 @@ Write-Host "Installing PyInstaller..." -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Building..." -ForegroundColor Yellow
 
-& $pythonPath -m PyInstaller --onefile --windowed --uac-admin --name="InputLocker" main.pyw
+& $pythonPath -m PyInstaller --onefile --windowed --uac-admin --icon="$PSScriptRoot\icon.ico" --add-data="$PSScriptRoot\icon.ico;." --name="InputLocker" main.pyw
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host ""

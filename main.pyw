@@ -37,7 +37,10 @@ NUMBER_KEYS = set(range(0x30, 0x3A))
 CAPS_LOCK_TRIGGER_COUNT = 3
 CAPS_LOCK_TRIGGER_WINDOW = 2.0
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "config.json")
+APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+ICON_FILE = os.path.join(RESOURCE_DIR, "icon.ico")
 DEFAULT_PASSWORD = "123456"
 
 
@@ -312,7 +315,11 @@ class LockApp:
         ctk.set_default_color_theme("dark-blue")
 
         self.root = ctk.CTk()
-        self.root.title("System Locker")
+        self.root.title("Input Locker")
+        try:
+            self.root.iconbitmap(ICON_FILE)
+        except Exception:
+            pass
         self.root.geometry("400x600")
         self.root.resizable(False, False)
         self.root.configure(fg_color=self.BG)
@@ -335,7 +342,7 @@ class LockApp:
         icon_label.pack(pady=(16, 4))
 
         ctk.CTkLabel(
-            container, text="System Locker",
+            container, text="Input Locker",
             font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
             text_color=self.TEXT
         ).pack(pady=(0, 4))
@@ -426,6 +433,10 @@ class LockApp:
 
         win = ctk.CTkToplevel(self.root)
         win.title("修改密码")
+        try:
+            win.iconbitmap(ICON_FILE)
+        except Exception:
+            pass
         win.geometry("360x420")
         win.resizable(False, False)
         win.configure(fg_color=self.BG)

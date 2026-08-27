@@ -58,6 +58,7 @@ pythonw main.pyw
 ```
 input-locker/
 ├── main.pyw          # 主程序（.pyw 无控制台窗口）
+├── icon.ico          # EXE 应用图标
 ├── build.ps1         # PowerShell 打包脚本
 ├── requirements.txt  # Python 依赖
 ├── .gitignore        # Git 忽略规则
