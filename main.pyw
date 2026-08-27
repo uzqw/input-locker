@@ -30,6 +30,7 @@ VK_CAPITAL = 0x14
 VK_BACK = 0x08
 VK_RETURN = 0x0D
 VK_SHIFT = 0x10
+CURSOR_SHOWING = 0x00000001
 
 LETTER_KEYS = set(range(0x41, 0x5B))
 NUMBER_KEYS = set(range(0x30, 0x3A))
@@ -79,6 +80,15 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("flags", ctypes.wintypes.DWORD),
+        ("hCursor", ctypes.wintypes.HANDLE),
+        ("ptScreenPos", ctypes.wintypes.POINT),
+    ]
+
+
 KBDHOOKPROC = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(KBDLLHOOKSTRUCT)
 )
@@ -104,6 +114,7 @@ class InputLocker:
 
         self._original_screensaver_active = None
         self._original_screensaver_timeout = None
+        self._cursor_hidden = False
 
     def set_password(self, new_password):
         self.unlock_password = new_password
@@ -132,6 +143,28 @@ class InputLocker:
         self._original_screensaver_active, self._original_screensaver_timeout = self._get_screensaver_settings()
         self._set_screensaver_settings("0", "0")
         kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+
+    def _hide_cursor(self):
+        if self._cursor_hidden:
+            return
+
+        cursor_info = CURSORINFO()
+        cursor_info.cbSize = ctypes.sizeof(cursor_info)
+        try:
+            is_visible = bool(user32.GetCursorInfo(ctypes.byref(cursor_info))) and bool(
+                cursor_info.flags & CURSOR_SHOWING
+            )
+        except Exception:
+            is_visible = True
+
+        if is_visible:
+            user32.ShowCursor(False)
+            self._cursor_hidden = True
+
+    def _restore_cursor(self):
+        if self._cursor_hidden:
+            user32.ShowCursor(True)
+            self._cursor_hidden = False
 
     def _restore_screen_settings(self):
         if self._original_screensaver_active is not None and self._original_screensaver_timeout is not None:
@@ -241,6 +274,7 @@ class InputLocker:
             self.caps_lock_press_times.clear()
 
             self._enable_screen_always_on()
+            self._hide_cursor()
             self._disable_usb_storage()
             self._install_hooks()
 
@@ -254,6 +288,7 @@ class InputLocker:
             self.remove_keyboard_hook()
             self._enable_usb_storage()
             self._restore_screen_settings()
+            self._restore_cursor()
             return False
 
     def stop_lock(self):
@@ -267,6 +302,7 @@ class InputLocker:
             self._remove_mouse_hook()
             self._enable_usb_storage()
             self._restore_screen_settings()
+            self._restore_cursor()
 
             return True
         except:
@@ -295,6 +331,10 @@ class InputLocker:
             self._restore_screen_settings()
         except:
             pass
+        try:
+            self._restore_cursor()
+        except:
+            pass
 
 
 class LockApp:
@@ -307,6 +347,13 @@ class LockApp:
     SUBTEXT = "#8e8e93"
     BORDER = "#d1d1d6"
 
+    @staticmethod
+    def _set_window_icon(window):
+        try:
+            window.iconbitmap(ICON_FILE)
+        except Exception:
+            pass
+
     def __init__(self, locker):
         self.locker = locker
         self._last_unlock_mode = False
@@ -316,10 +363,7 @@ class LockApp:
 
         self.root = ctk.CTk()
         self.root.title("Input Locker")
-        try:
-            self.root.iconbitmap(ICON_FILE)
-        except Exception:
-            pass
+        self._set_window_icon(self.root)
         self.root.geometry("400x600")
         self.root.resizable(False, False)
         self.root.configure(fg_color=self.BG)
@@ -433,10 +477,8 @@ class LockApp:
 
         win = ctk.CTkToplevel(self.root)
         win.title("修改密码")
-        try:
-            win.iconbitmap(ICON_FILE)
-        except Exception:
-            pass
+        self._set_window_icon(win)
+        win.after(350, lambda: self._set_window_icon(win))
         win.geometry("360x420")
         win.resizable(False, False)
         win.configure(fg_color=self.BG)
