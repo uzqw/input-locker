@@ -8,7 +8,8 @@ import atexit
 import traceback
 import json
 import os
-from tkinter import messagebox
+import datetime
+from tkinter import messagebox, filedialog
 import customtkinter as ctk
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -43,6 +44,10 @@ RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 ICON_FILE = os.path.join(RESOURCE_DIR, "icon.ico")
 DEFAULT_PASSWORD = "123456"
+# 与 gitea-commits 共享的计划文件默认位置（Windows 侧 Downloads，LLM 通过 API 写入）
+DEFAULT_PLAN_FILE = os.path.join(
+    os.environ.get("USERPROFILE", ""), "Downloads", "input-locker-plan.json"
+) if os.environ.get("USERPROFILE") else ""
 
 
 def load_config():
@@ -59,6 +64,26 @@ def save_config(config):
             json.dump(config, f, ensure_ascii=False, indent=2)
     except:
         pass
+
+
+WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _recurring_matches(when, now):
+    days = set(when.get("days") or [])
+    if not days:
+        return False
+    weekdays = {WEEKDAY_MAP[d] for d in days if d in WEEKDAY_MAP}
+    if "weekdays" in days:
+        weekdays |= {0, 1, 2, 3, 4}
+    if "weekends" in days:
+        weekdays |= {5, 6}
+    if "daily" in days:
+        weekdays = set(range(7))
+    if now.weekday() not in weekdays:
+        return False
+    t = (when.get("time") or "")[:5]
+    return bool(t) and t == now.strftime("%H:%M")
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -107,6 +132,8 @@ class InputLocker:
         self._kb_hook_proc = None
         self._mouse_hook_proc = None
         self._msg_thread = None
+        self._lock_ready = threading.Event()
+        self._lock_error = None
 
         self.caps_lock_press_times = []
         self.unlock_mode = False
@@ -118,7 +145,9 @@ class InputLocker:
 
     def set_password(self, new_password):
         self.unlock_password = new_password
-        save_config({"password": new_password})
+        cfg = load_config()
+        cfg["password"] = new_password
+        save_config(cfg)
 
     def _get_screensaver_settings(self):
         try:
@@ -259,12 +288,47 @@ class InputLocker:
         msg = ctypes.wintypes.MSG()
         while self.lock_active:
             if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                if msg.message == 0x0012:
+                if msg.message == 0x0012:  # WM_QUIT
                     break
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
             else:
                 time.sleep(0.01)
+
+    def _lock_worker(self):
+        """在专用线程安装钩子并跑消息循环（低级钩子回调必须由安装线程的消息循环驱动）。
+        start_lock 可从任意线程调用；钩子与消息循环始终在同一线程。"""
+        try:
+            self._install_hooks()
+            self._lock_error = None
+            self._lock_ready.set()
+            self._message_loop()
+        except Exception as e:
+            self._lock_error = e
+            self._lock_ready.set()
+        finally:
+            # 消息循环退出：卸钩子并恢复系统状态
+            self.lock_active = False
+            try:
+                self.remove_keyboard_hook()
+            except Exception:
+                pass
+            try:
+                self._remove_mouse_hook()
+            except Exception:
+                pass
+            try:
+                self._enable_usb_storage()
+            except Exception:
+                pass
+            try:
+                self._restore_screen_settings()
+            except Exception:
+                pass
+            try:
+                self._restore_cursor()
+            except Exception:
+                pass
 
     def start_lock(self):
         try:
@@ -273,37 +337,43 @@ class InputLocker:
             self._unlock_mode_changed = False
             self.caps_lock_press_times.clear()
 
+            self._lock_ready.clear()
+            self._lock_error = None
+
             self._enable_screen_always_on()
             self._hide_cursor()
             self._disable_usb_storage()
-            self._install_hooks()
 
-            self._msg_thread = threading.Thread(target=self._message_loop, daemon=True)
+            self._msg_thread = threading.Thread(target=self._lock_worker, daemon=True)
             self._msg_thread.start()
-
+            # 等钩子装好或失败（最多 5 秒），确认锁定真正生效
+            self._lock_ready.wait(timeout=5)
+            if self._lock_error:
+                raise self._lock_error
+            if not self.kb_hook_handle and not self.mouse_hook_handle:
+                raise RuntimeError("hooks not installed")
             return True
         except Exception:
+            # 标记退出，worker 线程的 finally 会自清理；这里不重复恢复系统状态
             self.lock_active = False
-            self._remove_mouse_hook()
-            self.remove_keyboard_hook()
-            self._enable_usb_storage()
-            self._restore_screen_settings()
-            self._restore_cursor()
+            self._lock_ready.set()
             return False
 
     def stop_lock(self):
         try:
-            self.lock_active = False
             self.unlock_mode = False
             self._unlock_mode_changed = False
-            time.sleep(0.2)
-
-            self.remove_keyboard_hook()
-            self._remove_mouse_hook()
+            if not self.lock_active and not (self._msg_thread and self._msg_thread.is_alive()):
+                return True
+            self.lock_active = False
+            # 向消息循环线程投递 WM_QUIT，让它退出并自行清理
+            if self._msg_thread and self._msg_thread.is_alive():
+                user32.PostThreadMessageW(self._msg_thread.ident, 0x0012, 0, 0)
+                self._msg_thread.join(timeout=3)
+            # worker 的 finally 已卸钩子并恢复系统；这里兜底再恢复一次（幂等）
             self._enable_usb_storage()
             self._restore_screen_settings()
             self._restore_cursor()
-
             return True
         except:
             return False
@@ -337,6 +407,120 @@ class InputLocker:
             pass
 
 
+class ScheduleWatcher:
+    """读取计划JSON + 命令文件：命中锁定/解锁条件则自动执行。
+    计划任务结构：{mode, when(锁定条件), unlock(解锁条件), confirm}。
+    命令文件：{"cmd": "lock"|"unlock"}，执行后删除并写 ack 文件。
+    """
+    def __init__(self, locker, file_var, status_cb, command_file, ack_file):
+        self.locker = locker
+        self.file_var = file_var
+        self.status_cb = status_cb
+        self.command_file = command_file
+        self.ack_file = ack_file
+        self._fired = {}  # (action, idx, date) -> date，防同一天重复触发
+        self._stop = False
+
+    def _load_tasks(self):
+        path = self.file_var
+        if not path or not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                tasks = json.load(f)
+            if isinstance(tasks, dict):
+                tasks = [tasks]
+            return tasks if isinstance(tasks, list) else []
+        except Exception:
+            return []
+
+    def _match(self, when, mode, now):
+        """when 条件是否命中。"""
+        if not when:
+            return False
+        if mode == "once":
+            try:
+                at = datetime.datetime.fromisoformat(when.get("at"))
+                # at 带时区时用 aware 的本地 now 比较，否则 naive 对 naive（否则 TypeError 被 except 吞掉，once 永不触发）
+                return at <= (now.astimezone() if at.tzinfo else now)
+            except Exception:
+                return False
+        return _recurring_matches(when, now)
+
+    def _do_lock(self, task):
+        ok = self.locker.start_lock()
+        confirm = task.get("confirm", "")
+        msg = ("计划触发自动锁定" if ok else "自动锁定失败") + (f"：{confirm}" if confirm else "")
+        self.status_cb(msg, ok)
+
+    def _do_unlock(self, task):
+        ok = self.locker.stop_lock()
+        confirm = task.get("confirm", "")
+        msg = ("计划触发自动解锁" if ok else "自动解锁失败") + (f"：{confirm}" if confirm else "")
+        self.status_cb(msg, ok)
+
+    def _check_plan(self, now):
+        for i, t in enumerate(self._load_tasks()):
+            mode = t.get("mode")
+            when = t.get("when") or {}
+            unlock = t.get("unlock") or {}
+            today = now.strftime("%Y-%m-%d")
+            # once 任务用 at 时间做防重 key（只触发一次），recurring 用日期（每天一次）
+            lock_key = ("lock", i, when.get("at") if mode == "once" else today)
+            unlock_key = ("unlock", i, unlock.get("at") if mode == "once" else today)
+            if self._match(when, mode, now):
+                if not self.locker.lock_active and self._fired.get(lock_key) != lock_key[2]:
+                    self._fired[lock_key] = lock_key[2]
+                    self._do_lock(t)
+                    return
+            if self._match(unlock, mode, now):
+                if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[2]:
+                    self._fired[unlock_key] = unlock_key[2]
+                    self._do_unlock(t)
+                    return
+
+    def _check_command(self):
+        if not self.command_file or not os.path.isfile(self.command_file):
+            return
+        try:
+            with open(self.command_file, "r", encoding="utf-8") as f:
+                cmd = json.load(f)
+            action = cmd.get("cmd")
+            result = "ok"
+            if action == "lock":
+                self._do_lock(cmd)
+            elif action == "unlock":
+                self._do_unlock(cmd)
+            else:
+                result = "bad cmd: " + str(action)
+            try:
+                os.remove(self.command_file)
+            except Exception:
+                pass
+            if self.ack_file:
+                try:
+                    with open(self.ack_file, "w", encoding="utf-8") as f:
+                        json.dump({"cmd": action, "result": result,
+                                   "ts": datetime.datetime.now().isoformat()}, f,
+                                  ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def run(self):
+        while not self._stop:
+            try:
+                self._check_command()
+                self._check_plan(datetime.datetime.now())
+            except Exception:
+                pass
+            time.sleep(1)
+
+    def stop(self):
+        self._stop = True
+
+
 class LockApp:
     BG = "#f2f2f7"
     CARD_BG = "#ffffff"
@@ -364,7 +548,7 @@ class LockApp:
         self.root = ctk.CTk()
         self.root.title("Input Locker")
         self._set_window_icon(self.root)
-        self.root.geometry("400x600")
+        self.root.geometry("400x680")
         self.root.resizable(False, False)
         self.root.configure(fg_color=self.BG)
 
@@ -374,6 +558,82 @@ class LockApp:
         self.root.bind("<Alt-F4>", lambda e: "break")
 
         self._poll_state()
+
+    def _build_schedule_ui(self, container):
+        schedule_cfg = load_config().get("schedule_file") or DEFAULT_PLAN_FILE or ""
+        self.schedule_frame = ctk.CTkFrame(container, fg_color=self.CARD_BG, corner_radius=12)
+        self.schedule_frame.pack(fill="x", pady=(8, 0))
+
+        ctk.CTkLabel(
+            self.schedule_frame, text="计划文件（LLM 通过接口写入，自动生效）",
+            font=ctk.CTkFont(size=12), text_color=self.SUBTEXT, anchor="w"
+        ).pack(fill="x", padx=16, pady=(12, 4))
+
+        self.schedule_path = ctk.CTkLabel(
+            self.schedule_frame, text="未选择", wraplength=250,
+            font=ctk.CTkFont(size=11), text_color=self.SUBTEXT, anchor="w"
+        )
+        self.schedule_path.pack(fill="x", padx=16)
+
+        self.schedule_file_var = schedule_cfg
+        if schedule_cfg:
+            self.schedule_path.configure(text=schedule_cfg)
+
+        ctk.CTkButton(
+            self.schedule_frame, text="选择计划文件", command=self._choose_schedule_file,
+            width=140, height=30, corner_radius=15,
+            fg_color=self.BG, hover_color="#e5e5ea",
+            text_color=self.SUBTEXT, border_width=1, border_color=self.BORDER,
+            font=ctk.CTkFont(size=12)
+        ).pack(pady=(8, 12), padx=16)
+
+        # 命令/ack 文件与计划文件同目录，供 gitea-commits 接口下发 lock/unlock 命令
+        plan_dir = os.path.dirname(schedule_cfg) if schedule_cfg else ""
+        command_file = os.path.join(plan_dir, "input-locker-command.json") if plan_dir else ""
+        ack_file = os.path.join(plan_dir, "input-locker-ack.json") if plan_dir else ""
+
+        self.watcher = ScheduleWatcher(
+            self.locker, self.schedule_file_var, self._schedule_status,
+            command_file, ack_file
+        )
+        self._watch_thread = threading.Thread(target=self.watcher.run, daemon=True)
+        self._watch_thread.start()
+
+    def _schedule_status(self, msg, ok):
+        self.root.after(0, lambda: self._apply_lock_state(msg, ok))
+
+    def _apply_lock_state(self, msg, ok):
+        """计划/命令触发锁定或解锁后，同步 UI 状态。"""
+        self.msg_label.configure(text=msg, text_color=self.GREEN if ok else self.RED)
+        locked = self.locker.lock_active
+        if locked:
+            self.status_label.configure(text="已锁定", text_color=self.RED)
+            self.lock_button.configure(state="disabled", fg_color="#c7c7cc")
+            self.change_pw_button.configure(state="disabled")
+        else:
+            self.status_label.configure(text="未锁定", text_color=self.GREEN)
+            self.lock_button.configure(state="normal", fg_color=self.ACCENT)
+            self.change_pw_button.configure(state="normal")
+            self.unlock_frame.pack_forget()
+            self._last_unlock_mode = False
+            self.root.attributes('-topmost', False)
+
+    def _choose_schedule_file(self):
+        initial = os.path.dirname(self.schedule_file_var) if self.schedule_file_var else \
+            os.path.join(os.environ.get("USERPROFILE", ""), "Downloads")
+        path = filedialog.askopenfilename(
+            title="选择计划文件",
+            initialdir=initial if os.path.isdir(initial) else None,
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not path:
+            return
+        self.schedule_file_var = path
+        self.schedule_path.configure(text=path)
+        cfg = load_config()
+        cfg["schedule_file"] = path
+        save_config(cfg)
+        self.msg_label.configure(text="已加载计划文件", text_color=self.GREEN)
 
     def _build_ui(self):
         container = ctk.CTkFrame(self.root, fg_color=self.BG)
@@ -470,6 +730,8 @@ class LockApp:
             ).pack(fill="x", padx=14, pady=2)
 
         ctk.CTkLabel(hint_card, text="").pack(pady=2)
+
+        self._build_schedule_ui(container)
 
     def _open_change_password(self):
         if self.locker.lock_active:
