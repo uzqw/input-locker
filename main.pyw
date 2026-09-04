@@ -1,7 +1,5 @@
 import ctypes
-import ctypes.wintypes
 import sys
-import winreg
 import threading
 import time
 import atexit
@@ -12,8 +10,18 @@ import datetime
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
 
-user32 = ctypes.WinDLL('user32', use_last_error=True)
-kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+IS_WAYLAND = IS_LINUX and (
+    os.environ.get("XDG_SESSION_TYPE") == "wayland"
+    or bool(os.environ.get("WAYLAND_DISPLAY"))
+)
+
+if IS_WINDOWS:
+    import ctypes.wintypes
+    import winreg
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -45,9 +53,14 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 ICON_FILE = os.path.join(RESOURCE_DIR, "icon.ico")
 DEFAULT_PASSWORD = "123456"
 # 与 gitea-commits 共享的计划文件默认位置（Windows 侧 Downloads，LLM 通过 API 写入）
-DEFAULT_PLAN_FILE = os.path.join(
-    os.environ.get("USERPROFILE", ""), "Downloads", "input-locker-plan.json"
-) if os.environ.get("USERPROFILE") else ""
+if os.environ.get("USERPROFILE"):
+    DEFAULT_PLAN_FILE = os.path.join(
+        os.environ["USERPROFILE"], "Downloads", "input-locker-plan.json"
+    )
+elif IS_LINUX:
+    DEFAULT_PLAN_FILE = os.path.expanduser("~/Downloads/input-locker-plan.json")
+else:
+    DEFAULT_PLAN_FILE = ""
 
 
 def load_config():
@@ -86,40 +99,41 @@ def _recurring_matches(when, now):
     return bool(t) and t == now.strftime("%H:%M")
 
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", ctypes.c_int),
-        ("scanCode", ctypes.c_int),
-        ("flags", ctypes.c_int),
-        ("time", ctypes.c_int),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_void_p))
-    ]
+if IS_WINDOWS:
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", ctypes.c_int),
+            ("scanCode", ctypes.c_int),
+            ("flags", ctypes.c_int),
+            ("time", ctypes.c_int),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_void_p))
+        ]
 
 
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("pt", ctypes.c_int * 2),
-        ("hwnd", ctypes.c_void_p),
-        ("wHitTestCode", ctypes.c_int),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_void_p))
-    ]
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("pt", ctypes.c_int * 2),
+            ("hwnd", ctypes.c_void_p),
+            ("wHitTestCode", ctypes.c_int),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_void_p))
+        ]
 
 
-class CURSORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.wintypes.DWORD),
-        ("flags", ctypes.wintypes.DWORD),
-        ("hCursor", ctypes.wintypes.HANDLE),
-        ("ptScreenPos", ctypes.wintypes.POINT),
-    ]
+    class CURSORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.wintypes.DWORD),
+            ("flags", ctypes.wintypes.DWORD),
+            ("hCursor", ctypes.wintypes.HANDLE),
+            ("ptScreenPos", ctypes.wintypes.POINT),
+        ]
 
 
-KBDHOOKPROC = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(KBDLLHOOKSTRUCT)
-)
-MOUSEHOOKPROC = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(MSLLHOOKSTRUCT)
-)
+    KBDHOOKPROC = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(KBDLLHOOKSTRUCT)
+    )
+    MOUSEHOOKPROC = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(MSLLHOOKSTRUCT)
+    )
 
 
 class InputLocker:
@@ -538,9 +552,10 @@ class LockApp:
         except Exception:
             pass
 
-    def __init__(self, locker):
+    def __init__(self, locker, wayland_fallback=False):
         self.locker = locker
         self._last_unlock_mode = False
+        self.wayland_fallback = wayland_fallback
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("dark-blue")
@@ -557,7 +572,20 @@ class LockApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Alt-F4>", lambda e: "break")
 
+        if hasattr(self.locker, "set_ui_callbacks"):
+            self.locker.set_ui_callbacks(self._linux_password_cb, self._linux_submit_cb)
+
         self._poll_state()
+
+    def _linux_password_cb(self, pwd):
+        self.root.after(0, lambda: self._set_password_display(pwd))
+
+    def _set_password_display(self, pwd):
+        self.password_entry.delete(0, "end")
+        self.password_entry.insert(0, pwd)
+
+    def _linux_submit_cb(self, pwd):
+        self.root.after(0, lambda: self.unlock(pwd))
 
     def _build_schedule_ui(self, container):
         schedule_cfg = load_config().get("schedule_file") or DEFAULT_PLAN_FILE or ""
@@ -620,7 +648,8 @@ class LockApp:
 
     def _choose_schedule_file(self):
         initial = os.path.dirname(self.schedule_file_var) if self.schedule_file_var else \
-            os.path.join(os.environ.get("USERPROFILE", ""), "Downloads")
+            (os.path.expanduser("~/Downloads") if IS_LINUX
+             else os.path.join(os.environ.get("USERPROFILE", ""), "Downloads"))
         path = filedialog.askopenfilename(
             title="选择计划文件",
             initialdir=initial if os.path.isdir(initial) else None,
@@ -638,6 +667,18 @@ class LockApp:
     def _build_ui(self):
         container = ctk.CTkFrame(self.root, fg_color=self.BG)
         container.pack(fill="both", expand=True, padx=24, pady=24)
+
+        if getattr(self, "wayland_fallback", False):
+            fallback_card = ctk.CTkFrame(container, fg_color=self.RED, corner_radius=12)
+            fallback_card.pack(fill="x", pady=(0, 12))
+            ctk.CTkLabel(
+                fallback_card,
+                text=("⚠ 无输入设备权限，已回退系统锁屏（系统密码解锁）\n"
+                      "运行 sudo usermod -aG input $USER 后重新登录，\n"
+                      "即可使用 3x CapsLock + 自定义密码 解锁"),
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                text_color="#ffffff", justify="left", wraplength=320,
+            ).pack(fill="x", padx=14, pady=10)
 
         icon_label = ctk.CTkLabel(
             container, text="🔒", font=ctk.CTkFont(size=48),
@@ -714,11 +755,24 @@ class LockApp:
 
         is_first_run = not os.path.exists(CONFIG_FILE)
 
-        hints = [
-            "锁定后: 键盘/鼠标禁用，USB存储禁用，屏幕常亮",
-            "解锁: 连按3次 CapsLock → 输入密码 → Enter",
-            "解锁模式下密码错误自动关闭",
-        ]
+        if IS_LINUX and IS_WAYLAND:
+            if getattr(self, "wayland_fallback", False):
+                hints = [
+                    "锁定后: 触发系统锁屏（系统密码解锁），屏幕常亮，USB存储禁用",
+                    "解锁: 在系统锁屏界面输入系统密码",
+                ]
+            else:
+                hints = [
+                    "锁定后: 键盘/鼠标禁用（evdev 内核级抓取），屏幕常亮，USB存储禁用",
+                    "解锁: 连按3次 CapsLock → 输入密码 → Enter",
+                    "解锁模式下密码错误自动关闭",
+                ]
+        else:
+            hints = [
+                "锁定后: 键盘/鼠标禁用，USB存储禁用，屏幕常亮",
+                "解锁: 连按3次 CapsLock → 输入密码 → Enter",
+                "解锁模式下密码错误自动关闭",
+            ]
         if is_first_run:
             hints.append(f"初始密码: {self.locker.unlock_password}，请及时修改")
 
@@ -837,6 +891,9 @@ class LockApp:
                 if new_mode != self._last_unlock_mode:
                     self._last_unlock_mode = new_mode
                     self._update_unlock_ui(new_mode)
+            # 锁定意外失效（如 X 连接断开）时同步 UI
+            if not self.locker.lock_active and str(self.lock_button.cget("state")) == "disabled":
+                self._apply_lock_state("已解锁", True)
         except Exception:
             pass
         self.root.after(100, self._poll_state)
@@ -868,16 +925,23 @@ class LockApp:
             self.status_label.configure(text="已锁定", text_color=self.RED)
             self.lock_button.configure(state="disabled", fg_color="#c7c7cc")
             self.change_pw_button.configure(state="disabled")
-            self.msg_label.configure(
-                text="已锁定 — 连按3次 CapsLock 解锁",
-                text_color=self.GREEN
-            )
+            if IS_WAYLAND and getattr(self, "wayland_fallback", False):
+                self.msg_label.configure(
+                    text="已锁定 — 系统锁屏已启动，用系统密码解锁",
+                    text_color=self.GREEN
+                )
+            else:
+                msg = "已锁定 — 连按3次 CapsLock 解锁"
+                if IS_LINUX and getattr(self.locker, "usb_storage_skipped", False):
+                    msg += "（USB 禁用需 root，已跳过）"
+                self.msg_label.configure(text=msg, text_color=self.GREEN)
             self.root.after(200, lambda: self.root.iconify())
         else:
             self.msg_label.configure(text="锁定失败!", text_color=self.RED)
 
-    def unlock(self):
-        password = self.password_entry.get()
+    def unlock(self, password=None):
+        if password is None:
+            password = self.password_entry.get()
         if password == self.locker.unlock_password:
             if self.locker.stop_lock():
                 self.status_label.configure(text="未锁定", text_color=self.GREEN)
@@ -897,7 +961,8 @@ class LockApp:
             self.msg_label.configure(text="密码错误 — 连按3次 CapsLock 重新解锁", text_color=self.RED)
 
     def on_close(self):
-        if self.locker.lock_active:
+        # Wayland 下系统锁屏才是真正的锁，关闭本程序不会解锁系统，允许关闭
+        if self.locker.lock_active and not IS_WAYLAND:
             return
         self.root.destroy()
 
@@ -905,21 +970,58 @@ class LockApp:
         self.root.mainloop()
 
 
-def main():
-    if not ctypes.windll.shell32.IsUserAnAdmin():
-        executable = sys.executable
-        if executable.endswith("python.exe"):
-            executable = executable[:-10] + "pythonw.exe"
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", executable, " ".join(sys.argv), None, 0
-        )
-        if result <= 32:
-            messagebox.showerror("错误", "需要管理员权限!\n\n请右键选择'以管理员身份运行'")
-        sys.exit(0)
+def _make_linux_locker():
+    """Linux 后端工厂：Wayland 下优先 EvdevLocker（自定义 3x CapsLock+密码 解锁），
+    失败时回退 WaylandLocker（系统锁屏）并提示。返回 (locker, 回退是否发生)。"""
+    if not IS_WAYLAND:
+        from linux_locker import LinuxInputLocker
+        return LinuxInputLocker(), False
+    try:
+        from linux_locker import EvdevLocker
+        locker = EvdevLocker()
+        ok = locker.start_lock()
+        if not ok:
+            locker.emergency_restore()
+            locker = None
+        if ok:
+            locker.stop_lock()
+            return locker, False
+    except Exception:
+        pass
+    # 无 /dev/input 权限或 evdev 不可用 -> 回退系统锁屏
+    from linux_locker import WaylandLocker
+    return WaylandLocker(), True
 
-    locker = InputLocker()
+
+def main():
+    if IS_WINDOWS:
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            executable = sys.executable
+            if executable.endswith("python.exe"):
+                executable = executable[:-10] + "pythonw.exe"
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", executable, " ".join(sys.argv), None, 0
+            )
+            if result <= 32:
+                messagebox.showerror("错误", "需要管理员权限!\n\n请右键选择'以管理员身份运行'")
+            sys.exit(0)
+        locker = InputLocker()
+    elif IS_LINUX:
+        locker, wayland_fallback = _make_linux_locker()
+    else:
+        locker = InputLocker()
+
     atexit.register(locker.emergency_restore)
-    app = LockApp(locker)
+    app = LockApp(locker, wayland_fallback)
+
+    if wayland_fallback:
+        app.root.after(
+            600, lambda: messagebox.showwarning(
+                "权限不足",
+                "无法访问输入设备，已回退系统锁屏。\n\n"
+                "如需 3x CapsLock + 自定义密码 解锁：\n"
+                "    sudo usermod -aG input $USER\n"
+                "然后重新登录。"))
 
     try:
         app.run()

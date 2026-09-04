@@ -4,7 +4,7 @@
 
 > ⬇️ **[下载最新版 InputLocker.exe](https://github.com/he-zhiyuan/input-locker/releases/latest)**
 
-Windows 输入设备锁定工具。适用于笔记本电脑的展示/防误触场景，锁定后键盘、鼠标禁用，USB存储禁用，屏幕保持常亮，通过 CapsLock+密码解锁。
+Windows / Linux 输入设备锁定工具。适用于笔记本电脑的展示/防误触场景，锁定后键盘、鼠标禁用，USB存储禁用，屏幕保持常亮，通过 CapsLock+密码解锁。
 
 ## ✨ 功能
 
@@ -14,7 +14,7 @@ Windows 输入设备锁定工具。适用于笔记本电脑的展示/防误触�
 | 🖱️ 鼠标锁定 | 锁定期间全程禁用，光标隐藏，解锁模式下同样不可用 |
 | 💾 USB存储禁用 | 禁用U盘等USB存储设备（不影响笔记本自带键盘/触控板） |
 | 💡 屏幕常亮 | 禁用屏保和自动息屏 |
-| 🛡️ 防杀后台 | 通过 `SetThreadExecutionState` 阻止系统休眠 |
+| 🛡️ 防杀后台 | 阻止系统休眠（Windows: `SetThreadExecutionState`；Linux: `systemd-inhibit`） |
 | 🔑 密码保护 | 支持修改密码，持久化保存到 config.json |
 | 🔄 崩溃恢复 | 注册 `atexit` 回调，程序异常退出时自动恢复系统设置 |
 
@@ -33,20 +33,46 @@ Windows 输入设备锁定工具。适用于笔记本电脑的展示/防误触�
 
 ## 🚀 使用方法
 
-### 直接运行
+### Windows
 
 ```bash
 # 需要管理员权限（.pyw 无控制台窗口）
 pythonw main.pyw
 ```
 
-### 打包成 EXE
+打包成 EXE：
 
 ```powershell
 .\build.ps1
 ```
 
 打包后右键 `dist\InputLocker.exe` → 以管理员身份运行。
+
+### Linux
+
+```bash
+# 依赖（evdev 从源码需要内核头文件；Manjaro/Arch 系统 python 受 PEP668 保护，
+# 建议用 venv 或加 --break-system-packages）
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python main.pyw
+```
+
+按会话类型自动选择后端：
+
+| 会话 | 后端 | 行为 |
+|------|------|------|
+| **X11**（Xorg） | `LinuxInputLocker` | XGrabKeyboard/XGrabPointer 全局拦截，与 Windows 版完全一致：3x CapsLock + 自定义密码解锁，解锁时鼠标仍禁用，光标隐藏 |
+| **Wayland**（KDE Plasma 等） | `EvdevLocker`（优先） | evdev `EVIOCGRAB` 内核级设备抓取，与显示服务器无关，X11/Wayland 均有效：3x CapsLock + 自定义密码解锁，鼠标/触摸屏同样抓取 |
+| **Wayland** 无设备权限时 | `WaylandLocker`（回退） | 回退**系统锁屏**（`loginctl lock-session`，系统密码解锁）+ `systemd-inhibit` 保持屏幕常亮/阻止休眠 |
+
+> ⚠️ Wayland 下使用自定义解锁需对 `/dev/input/event*` 有读写权限（root 或 `input` 组成员）。加入 input 组后**重新登录**生效：
+>
+> ```bash
+> sudo usermod -aG input $USER
+> # 重新登录后生效
+> ```
+>
+> 无权限时自动回退系统锁屏并在界面提示（系统密码解锁）。Linux 下无需 root 即可锁定输入；**USB 存储禁用需要 root**（非 root 时自动跳过并在界面提示）。如需 USB 禁用，用 `sudo python3 main.pyw` 运行。
 
 ## 🔑 修改密码
 
@@ -59,6 +85,7 @@ pythonw main.pyw
 ```
 input-locker/
 ├── main.pyw          # 主程序（.pyw 无控制台窗口）
+├── linux_locker.py   # Linux 后端（X11 抓取 / evdev 抓取 / Wayland 系统锁屏）
 ├── icon.ico          # EXE 应用图标
 ├── build.ps1         # PowerShell 打包脚本
 ├── requirements.txt  # Python 依赖
@@ -69,11 +96,11 @@ input-locker/
 
 ## ⚠️ 注意事项
 
-- 🏷️ **必须以管理员身份运行**
+- 🏷️ **Windows 必须以管理员身份运行**；Linux 无需 root（USB 禁用除外）
 - 💻 本程序专为笔记本电脑设计（自带键盘非 USB，可安全禁用 USB 存储）
-- ⚡ Ctrl+Alt+Del 是 Windows 安全序列，低级键盘钩子无法拦截，始终可用作紧急手段
-- 🔌 USB存储禁用仅影响 USBSTOR（U盘等），不影响笔记本自带键盘/触控板
-- 🔒 锁定时无法关闭窗口，必须先解锁
+- ⚡ Windows 下 Ctrl+Alt+Del 是安全序列，低级键盘钩子无法拦截，始终可用作紧急手段；Linux X11 下杀掉进程即可释放抓取（X 服务器会自动解除）
+- 🔌 USB存储禁用仅影响 USB 大容量存储设备（U盘等），不影响笔记本自带键盘/触控板
+- 🔒 Windows 锁定时无法关闭窗口，必须先解锁；Linux Wayland 下可关闭（系统锁屏不受影响）
 - 🔄 程序崩溃时会通过 `atexit` 尝试恢复设置
 
 ## 🆘 紧急恢复

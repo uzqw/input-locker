@@ -1,2 +1,4 @@
 pyinstaller>=6.0
 customtkinter>=5.2
+python-xlib>=0.33; sys_platform == "linux"
+evdev>=1.6; sys_platform == "linux"
