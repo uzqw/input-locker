@@ -31,6 +31,9 @@ Windows / Linux 输入设备锁定工具。适用于笔记本电脑的展示/防
 - 👻 锁定期间屏幕光标暂时隐藏，解锁后恢复原状态
 - ❌ 密码错误自动关闭解锁模式，需重新触发
 
+> 💡 Windows 与 Linux（X11 / 有 input 权限的 Wayland）解锁流程相同，均为上述自定义密码流程；
+> 仅当 Wayland 无 input 权限回退到系统锁屏时，才改用系统密码在锁屏界面解锁。
+
 ## 🚀 使用方法
 
 ### Windows
@@ -50,12 +53,49 @@ pythonw main.pyw
 
 ### Linux
 
+#### 1. 安装依赖
+
+> Arch/Manjaro 的系统 Python 受 PEP668 保护，直接 `pip install` 会拒绝；
+> 建议用自带的 venv（evdev 编译需要内核头文件，Manjaro 可先 `sudo pacman -S linux-headers`）。
+
 ```bash
-# 依赖（evdev 从源码需要内核头文件；Manjaro/Arch 系统 python 受 PEP668 保护，
-# 建议用 venv 或加 --break-system-packages）
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cd input-locker
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+#### 2. 添加 input 组权限（Wayland 自定义解锁必需）
+
+程序用 evdev 内核级抓取锁定输入（`EVIOCGRAB`），需要能读写 `/dev/input/event*`。
+非 root 用户需加入 `input` 组并**重新登录**（注销/重启后权限才生效）：
+
+```bash
+sudo usermod -aG input $USER
+# 然后注销重新登录，或重启
+```
+
+**验证是否已生效**（应能看到一串设备）：
+
+```bash
+ls -l /dev/input/event*  # 检查 /dev/input 目录权限
+id                        # 输出里应包含 input 组
+```
+
+> 没加 input 组也能启动，但会回退系统锁屏模式（用系统密码解锁），并弹出提示。
+> 或者直接用 root 跑（`sudo .venv/bin/python main.pyw`）也能获得完整功能，但这样 USB 存储禁用
+> 也会一并启用（见下文）。
+
+#### 3. 启动
+
+**必须在图形桌面环境里启动**（终端需继承 DISPLAY/WAYLAND_DISPLAY 等变量，例如 KDE 桌面的 Konsole，
+而不是 SSH/纯 tty/IDE 内置终端）：
+
+```bash
+cd input-locker
 .venv/bin/python main.pyw
 ```
+
+启动后主界面显示「锁定系统」，点它即开始锁定。
 
 按会话类型自动选择后端：
 
@@ -65,14 +105,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | **Wayland**（KDE Plasma 等） | `EvdevLocker`（优先） | evdev `EVIOCGRAB` 内核级设备抓取，与显示服务器无关，X11/Wayland 均有效：3x CapsLock + 自定义密码解锁，鼠标/触摸屏同样抓取 |
 | **Wayland** 无设备权限时 | `WaylandLocker`（回退） | 回退**系统锁屏**（`loginctl lock-session`，系统密码解锁）+ `systemd-inhibit` 保持屏幕常亮/阻止休眠 |
 
-> ⚠️ Wayland 下使用自定义解锁需对 `/dev/input/event*` 有读写权限（root 或 `input` 组成员）。加入 input 组后**重新登录**生效：
+> ⚠️ Wayland 下使用自定义解锁需对 `/dev/input/event*` 有读写权限（root 或 `input` 组成员）——**配置方法见上方「步骤 2」**。无权限时自动回退系统锁屏并在界面提示（系统密码解锁）。
 >
-> ```bash
-> sudo usermod -aG input $USER
-> # 重新登录后生效
-> ```
->
-> 无权限时自动回退系统锁屏并在界面提示（系统密码解锁）。Linux 下无需 root 即可锁定输入；**USB 存储禁用需要 root**（非 root 时自动跳过并在界面提示）。如需 USB 禁用，用 `sudo python3 main.pyw` 运行。
+> Linux 下无需 root 即可锁定输入；**USB 存储禁用需要 root**（非 root 时自动跳过并在界面提示）。如需 USB 禁用，用 `sudo .venv/bin/python main.pyw` 运行。
 
 ## 🔑 修改密码
 
