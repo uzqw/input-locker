@@ -52,6 +52,10 @@ HI_PATH = (
     "/System/Library/Frameworks/ApplicationServices.framework/"
     "Frameworks/HIServices.framework/HIServices"
 )
+IOKIT_PATH = "/System/Library/Frameworks/IOKit.framework/IOKit"
+
+kIOHIDCapsLockState = 1
+kIOHIDParamConnectType = 1  # IOHIDShared.h: kIOHIDServerConnectType=0, kIOHIDParamConnectType=1
 
 TAP_CB = ctypes.CFUNCTYPE(
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p
@@ -149,6 +153,67 @@ def _libs():
         _bind(cg, cf)
         _LIBS = (cg, cf)
     return _LIBS
+
+
+_HID = None
+_HID_CONNECT = None
+
+
+def _hid():
+    """IOKit 连接：IOHIDSetModifierLockState 驱动 CapsLock 锁存 + LED。
+    惰性加载，失败返回 None（灯状态保持驱动 toggle 结果，功能不受影响）。"""
+    global _HID, _HID_CONNECT
+    if _HID is None:
+        try:
+            iokit = ctypes.CDLL(IOKIT_PATH)
+            iokit.IOServiceGetMatchingService.restype = ctypes.c_uint32
+            iokit.IOServiceGetMatchingService.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            iokit.IOServiceMatching.restype = ctypes.c_void_p
+            iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+            iokit.IOServiceOpen.restype = ctypes.c_int32
+            iokit.IOServiceOpen.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            iokit.IOObjectRelease.argtypes = [ctypes.c_uint32]
+            iokit.IOHIDSetModifierLockState.restype = ctypes.c_int32
+            iokit.IOHIDSetModifierLockState.argtypes = [
+                ctypes.c_uint32, ctypes.c_int32, ctypes.c_bool,
+            ]
+            _HID = iokit
+        except Exception:
+            return None
+    if _HID_CONNECT is None:
+        try:
+            libc = ctypes.CDLL(None)
+            mach_task_self = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
+            service = _HID.IOServiceGetMatchingService(
+                0, _HID.IOServiceMatching(b"IOHIDSystem"))
+            if not service:
+                return None
+            connect = ctypes.c_uint32(0)
+            if _HID.IOServiceOpen(
+                    service, mach_task_self, kIOHIDParamConnectType,
+                    ctypes.byref(connect)) != 0:
+                return None
+            _HID.IOObjectRelease(service)
+            _HID_CONNECT = connect.value
+        except Exception:
+            return None
+    return _HID_CONNECT
+
+
+def _set_caps_lock_state(on):
+    """把 CapsLock 锁存/LED 设回指定状态（社区做法：驱动层 toggle 无法拦截，
+    检测到翻转后立即设回，用户看不到灯变化）。返回是否成功。"""
+    connect = _hid()
+    if not connect:
+        return False
+    try:
+        return _HID.IOHIDSetModifierLockState(
+            connect, kIOHIDCapsLockState, bool(on)) == 0
+    except Exception:
+        return False
 
 
 def _ax_lib():
@@ -254,6 +319,8 @@ class MacInputLocker:
         self._caps_times = []
         self._pwd = ""
         self._caps_on = False
+        self._restoring = False
+        self._caps_echo_until = 0.0
         self._q = None
         self._cf = None
         self._tap = None
@@ -285,6 +352,8 @@ class MacInputLocker:
             self._pwd = ""
             self._caps_times.clear()
             self._caps_on = False
+            self._restoring = False
+            self._caps_echo_until = 0.0
             self._ready.clear()
             self._error = None
             if not _is_trusted(prompt=True):
@@ -428,11 +497,18 @@ class MacInputLocker:
 
     def _handle(self, etype, flags=0, keycode=0, chars=""):
         if etype == kCGEventFlagsChanged:
+            now = time.time()
+            # IOHIDSetModifierLockState 会同步/异步回灌 flagsChanged。回灌期间
+            # 再计数或再设回，会把 _caps_on 和真实灯状态打乱，之后按键再也对不上沿。
+            if self._restoring:
+                return
             caps = bool(flags & kCGEventFlagMaskAlphaShift)
+            if now < self._caps_echo_until and caps == self._caps_on:
+                return
             prev = self._caps_on
             self._caps_on = caps
-            if keycode == kVK_CapsLock and caps and not prev:
-                now = time.time()
+            if keycode == kVK_CapsLock and caps != prev:
+                # CapsLock 是切换键：按一下 AlphaShift 翻转一次。数翻转而不是只数 off→on。
                 self._caps_times.append(now)
                 self._caps_times = [t for t in self._caps_times if now - t < CAPS_TRIGGER_WINDOW]
                 if len(self._caps_times) >= CAPS_TRIGGER_COUNT:
@@ -441,6 +517,14 @@ class MacInputLocker:
                     if self.unlock_mode:
                         self._pwd = ""
                     self._unlock_mode_changed = True
+                self._restoring = True
+                try:
+                    ok = _set_caps_lock_state(prev)
+                finally:
+                    self._restoring = False
+                if ok:
+                    self._caps_on = prev
+                    self._caps_echo_until = now + 0.08
             return
         if etype != kCGEventKeyDown or not self.unlock_mode:
             return

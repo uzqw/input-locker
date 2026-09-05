@@ -291,9 +291,13 @@ class MacLockerTests(unittest.TestCase):
         )
         off, on = 0, macos_locker.kCGEventFlagMaskAlphaShift
         caps = macos_locker.kVK_CapsLock
-        for _ in range(3):
-            self.locker._handle(macos_locker.kCGEventFlagsChanged, off, caps)
-            self.locker._handle(macos_locker.kCGEventFlagsChanged, on, caps)
+        # 灯初始灭：每次按压驱动 toggle 灯亮（on），我们设回灭，所以事件流是 on,on,on。
+        with patch.object(macos_locker, '_set_caps_lock_state') as restore:
+            for _ in range(3):
+                self.locker._handle(macos_locker.kCGEventFlagsChanged, on, caps)
+            # 每次翻转后设回翻转前状态（灯灭）
+            self.assertEqual(restore.call_count, 3)
+            restore.assert_called_with(False)
         self.assertTrue(self.locker.unlock_mode)
         self.locker._handle(macos_locker.kCGEventKeyDown, 0, 0, 'a')
         self.locker._handle(macos_locker.kCGEventKeyDown, 0, macos_locker.kVK_Delete)
@@ -303,6 +307,55 @@ class MacLockerTests(unittest.TestCase):
         self.assertTrue(self.locker.stop_lock())
         self.assertFalse(self.locker.lock_active)
         self.assertFalse(self.locker._cursor_hidden)
+
+    def test_caps_three_presses_when_led_starts_on(self):
+        """锁定时 CapsLock 灯已亮：旧逻辑只数 off→on 沿，需按 6 次；
+        应数翻转（caps != prev），3 次按压即可。每次翻转后设回灯亮。"""
+        self.assertTrue(self.locker.start_lock())
+        off, on = 0, macos_locker.kCGEventFlagMaskAlphaShift
+        caps = macos_locker.kVK_CapsLock
+        self.locker._caps_on = True  # 灯初始亮（锁屏前 CapsLock 开着）
+        with patch.object(macos_locker, '_set_caps_lock_state') as restore:
+            # 灯亮时每次按压驱动 toggle 灯灭（off），设回亮 → 事件流 off,off,off
+            for _ in range(3):
+                self.locker._handle(macos_locker.kCGEventFlagsChanged, off, caps)
+            self.assertEqual(restore.call_count, 3)
+            restore.assert_called_with(True)
+        self.assertTrue(self.locker.unlock_mode)
+        self.assertTrue(self.locker.stop_lock())
+
+    def test_caps_restore_echo_does_not_desync_or_double_count(self):
+        """IOHIDSetModifierLockState 同步回灌 flagsChanged 时不得再计数、不得打乱 _caps_on。"""
+        self.assertTrue(self.locker.start_lock())
+        on = macos_locker.kCGEventFlagMaskAlphaShift
+        caps = macos_locker.kVK_CapsLock
+        def restore(prev):
+            echo = on if prev else 0
+            self.locker._handle(macos_locker.kCGEventFlagsChanged, echo, caps)
+            return True
+        with patch.object(macos_locker, '_set_caps_lock_state', side_effect=restore):
+            for _ in range(3):
+                self.locker._handle(macos_locker.kCGEventFlagsChanged, on, caps)
+        self.assertTrue(self.locker.unlock_mode)
+        self.assertFalse(self.locker._caps_on)
+        self.assertTrue(self.locker.stop_lock())
+
+    def test_caps_stale_press_expires_then_three_more_unlock(self):
+        """按 1 下后超过 2s 窗口，再匀速 3 下仍应解锁（不得卡死）。"""
+        self.assertTrue(self.locker.start_lock())
+        on = macos_locker.kCGEventFlagMaskAlphaShift
+        caps = macos_locker.kVK_CapsLock
+        t = [100.0]
+        with patch.object(macos_locker.time, 'time', lambda: t[0]), \
+             patch.object(macos_locker, '_set_caps_lock_state', return_value=True):
+            self.locker._handle(macos_locker.kCGEventFlagsChanged, on, caps)
+            self.assertFalse(self.locker.unlock_mode)
+            t[0] += 3.0
+            for _ in range(3):
+                t[0] += 0.1
+                self.locker._handle(macos_locker.kCGEventFlagsChanged, on, caps)
+            self.assertTrue(self.locker.unlock_mode)
+        self.assertTrue(self.locker.stop_lock())
 
     def test_disabled_tap_reenables_or_stops(self):
         event = object()
