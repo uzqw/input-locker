@@ -405,5 +405,14 @@ class MacAxPromptTests(unittest.TestCase):
         cf.CFRelease.assert_called_once_with(0x4001)
 
 
+class CfSymbolTests(unittest.TestCase):
+    def test_cf_symbol_matches_in_dll_pointer(self):
+        libc = ctypes.CDLL(None)
+        self.assertEqual(
+            macos_locker._cf_symbol(libc, "stdout").value,
+            ctypes.c_void_p.in_dll(libc, "stdout").value,
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

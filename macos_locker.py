@@ -88,9 +88,7 @@ def _save_config(config):
 
 
 def _cf_symbol(cf, name):
-    return ctypes.cast(
-        ctypes.c_void_p.in_dll(cf, name), ctypes.POINTER(ctypes.c_void_p)
-    ).contents
+    return ctypes.c_void_p.in_dll(cf, name)
 
 
 def _bind(cg, cf):
