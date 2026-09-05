@@ -130,7 +130,7 @@ systemctl --user disable input-locker.service  # 取消自启
 - 命令格式：`{"cmd":"lock","id":"唯一命令ID"}`，也接受旧版不带 `id` 的命令。ack 原样回传 `id`，`result` 为 `ok` 或 `error`，失败时附 `error` 原因。`ok` 表示该次操作成功，不是持续锁定状态监测。
 - 消费者先把命令原子移动到 `.processing` 再执行，ack 原子写入；执行中收到的新命令不会被旧命令删除。
 - MCP 服务端必须核对 ack 的 `id` 与本次命令一致；更新协议时需同时更新并重启 input-locker 和 aide。
-- 重启前检查计划文件：已过期的 once 计划目前仍可能先锁再解锁，应先归档/移除过期任务，避免意外触发。
+- once 只在 `when.at ≤ now < unlock.at` 期间自动上锁；解锁时刻已过则重启也不会再锁。Linux 启动只查 evdev 权限、窗口最小化，不探测锁屏、不弹权限对话框。
 
 无真实锁屏的回归检查（模拟设备、无需显示会话）：
 

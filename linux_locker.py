@@ -33,6 +33,17 @@ try:
 except ImportError:
     evdev = None  # 未安装时 EvdevLocker 不可用，回退系统锁屏
 
+
+def evdev_available():
+    """能否读写 /dev/input/event*。只检查权限，不抓取、不锁屏。"""
+    if evdev is None:
+        return False
+    try:
+        paths = evdev.list_devices()
+    except Exception:
+        return False
+    return any(os.access(p, os.R_OK | os.W_OK) for p in paths)
+
 # ---- 常量 ----
 XK_CAPS_LOCK = 0xFFE5
 XK_BACKSPACE = 0xFF08

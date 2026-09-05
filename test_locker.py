@@ -84,6 +84,16 @@ class LockerTests(unittest.TestCase):
         self.inhibitors[0].terminate.assert_called_once()
         self.inhibitors[0].wait.assert_called_once()
 
+    def test_expired_once_does_not_lock_on_restart(self):
+        now = datetime.datetime.fromisoformat('2026-09-05T10:12:00+08:00')
+        self.plan.write_text(json.dumps([dict(mode='once',
+            when=dict(at='2026-09-05T10:06:03+08:00'),
+            unlock=dict(at='2026-09-05T10:11:03+08:00'))]))
+        self.watcher._check_plan(now)
+        self.assertFalse(self.locker.lock_active)
+        self.locker._open_devices.assert_not_called()
+        self.assertEqual(self.inhibitors, [])
+
     def test_concurrent_lock_calls_start_one_worker(self):
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda _: self.locker.start_lock(), range(16)))
@@ -190,6 +200,15 @@ class LockerTests(unittest.TestCase):
             locker._poll()
             active.assert_not_called()
         self.assertTrue(locker.lock_active)
+
+    def test_startup_probe_does_not_lock(self):
+        with patch.object(backend, 'evdev', None):
+            self.assertFalse(backend.evdev_available())
+        with patch.object(backend.evdev, 'list_devices', return_value=['/dev/input/event0']), \
+             patch.object(backend.os, 'access', return_value=True):
+            self.assertTrue(backend.evdev_available())
+        self.locker._open_devices.assert_not_called()
+        self.assertEqual(self.inhibitors, [])
 
     def test_other_backends_already_locked_are_noops(self):
         for cls in (backend.LinuxInputLocker, backend.WaylandLocker, app.InputLocker):

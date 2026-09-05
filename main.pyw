@@ -509,12 +509,20 @@ class ScheduleWatcher:
             # once 任务用 at 时间做防重 key（只触发一次），recurring 用日期（每天一次）
             lock_key = ("lock", i, when.get("at") if mode == "once" else today)
             unlock_key = ("unlock", i, unlock.get("at") if mode == "once" else today)
-            if self._match(when, mode, now):
+            lock_due = self._match(when, mode, now)
+            unlock_due = self._match(unlock, mode, now)
+            if mode == "once" and unlock_due:
+                # 解锁时刻已过：过期 once 重启不再上锁，也不必先清空计划。
+                if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[2]:
+                    self._fired[unlock_key] = unlock_key[2]
+                    self._do_unlock(t)
+                return
+            if lock_due:
                 if not self.locker.lock_active and self._fired.get(lock_key) != lock_key[2]:
                     self._fired[lock_key] = lock_key[2]
                     self._do_lock(t)
                     return
-            if self._match(unlock, mode, now):
+            if unlock_due:
                 if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[2]:
                     self._fired[unlock_key] = unlock_key[2]
                     self._do_unlock(t)
@@ -619,6 +627,8 @@ class LockApp:
         self.root.configure(fg_color=self.BG)
 
         self._build_ui()
+        if IS_LINUX:
+            self.root.after(0, self.root.iconify)  # 后台服务，启动不抢焦点。
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Alt-F4>", lambda e: "break")
@@ -1023,24 +1033,13 @@ class LockApp:
 
 def _make_linux_locker():
     """Linux 后端工厂：Wayland 下优先 EvdevLocker（自定义 3x CapsLock+密码 解锁），
-    失败时回退 WaylandLocker（系统锁屏）并提示。返回 (locker, 回退是否发生)。"""
+    失败时回退 WaylandLocker（系统锁屏）。探测只查权限，不真正锁屏。"""
     if not IS_WAYLAND:
         from linux_locker import LinuxInputLocker
         return LinuxInputLocker(), False
-    try:
-        from linux_locker import EvdevLocker
-        locker = EvdevLocker()
-        ok = locker.start_lock()
-        if not ok:
-            locker.emergency_restore()
-            locker = None
-        if ok:
-            locker.stop_lock()
-            return locker, False
-    except Exception:
-        pass
-    # 无 /dev/input 权限或 evdev 不可用 -> 回退系统锁屏
-    from linux_locker import WaylandLocker
+    from linux_locker import EvdevLocker, WaylandLocker, evdev_available
+    if evdev_available():
+        return EvdevLocker(), False
     return WaylandLocker(), True
 
 
@@ -1064,16 +1063,6 @@ def main():
 
     atexit.register(locker.emergency_restore)
     app = LockApp(locker, wayland_fallback)
-
-    if wayland_fallback:
-        app.root.after(
-            600, lambda: messagebox.showwarning(
-                "权限不足",
-                "无法访问输入设备，已回退系统锁屏。\n\n"
-                "如需 3x CapsLock + 自定义密码 解锁：\n"
-                "    sudo usermod -aG input $USER\n"
-                "然后重新登录。"))
-
     try:
         app.run()
     except Exception:
