@@ -7,6 +7,7 @@ import traceback
 import json
 import os
 import datetime
+import subprocess
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
 from locker_lifecycle import serialized
@@ -973,9 +974,18 @@ class LockApp:
 
     def _restore_and_focus(self):
         self.root.attributes('-topmost', True)
-        self.root.state('normal')
+        self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        # mutter 下 Tk 的 deiconify/lift 不可靠（窗口仍 HIDDEN 或被全屏窗口盖住），
+        # 用 xdotool 强制激活置顶；无 xdotool 时静默回退。
+        try:
+            subprocess.run(
+                ["xdotool", "search", "--name", "Input Locker", "windowactivate"],
+                timeout=2, capture_output=True,
+            )
+        except Exception:
+            pass
         try:
             self.password_entry._entry.focus_set()
         except Exception:
@@ -1010,6 +1020,7 @@ class LockApp:
                 self.lock_button.configure(state="normal", fg_color=self.ACCENT)
                 self.change_pw_button.configure(state="normal")
                 self.root.attributes('-topmost', False)
+                self.root.attributes('-fullscreen', False)
                 self.unlock_frame.pack_forget()
                 self._last_unlock_mode = False
                 self.msg_label.configure(text="已成功解锁", text_color=self.GREEN)
@@ -1020,6 +1031,7 @@ class LockApp:
             self.unlock_frame.pack_forget()
             self._last_unlock_mode = False
             self.password_entry.delete(0, 'end')
+            self.root.attributes('-fullscreen', False)
             self.msg_label.configure(text="密码错误 — 连按3次 CapsLock 重新解锁", text_color=self.RED)
 
     def on_close(self):

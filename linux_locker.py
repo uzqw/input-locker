@@ -427,10 +427,10 @@ class LinuxInputLocker:
             self._caps_times = [t for t in self._caps_times if now - t < CAPS_TRIGGER_WINDOW]
             if len(self._caps_times) >= CAPS_TRIGGER_COUNT:
                 self._caps_times.clear()
-                self.unlock_mode = not self.unlock_mode
-                if self.unlock_mode:
+                if not self.unlock_mode:
+                    self.unlock_mode = True
                     self._pwd = ""
-                self._unlock_mode_changed = True
+                    self._unlock_mode_changed = True
             return
         if not self.unlock_mode:
             return
@@ -648,10 +648,10 @@ class EvdevLocker:
                                 if now - t < CAPS_TRIGGER_WINDOW]
             if len(self._caps_times) >= CAPS_TRIGGER_COUNT:
                 self._caps_times.clear()
-                self.unlock_mode = not self.unlock_mode
-                if self.unlock_mode:
+                if not self.unlock_mode:
+                    self.unlock_mode = True
                     self._pwd = ""
-                self._unlock_mode_changed = True
+                    self._unlock_mode_changed = True
             return
         if not self.unlock_mode:
             return
