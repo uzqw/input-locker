@@ -1,0 +1,17 @@
+# Input Locker 开机自动启动（systemd --user，登录进图形会话时启动）
+# 安装: cp input-locker.service ~/.config/systemd/user/ && systemctl --user enable input-locker.service
+# 说明: 这是 GUI 应用，必须等图形会话就绪，所以挂在 graphical-session.target 下，
+#       不需要(也不应该) loginctl enable-linger —— linger 是给无图形会话的后台服务的。
+[Unit]
+Description=Input Locker (keyboard/mouse lock)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h//path/to/input-locker/.venv/bin/python %h//path/to/input-locker/main.pyw
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

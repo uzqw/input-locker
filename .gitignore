@@ -49,3 +49,8 @@ input-locker-ack.json
 *.spec
 *.exe
 *.dll
+
+# Local tooling / runtime state
+.codegraph/
+input-locker-last-command.json
+*.bak-*
