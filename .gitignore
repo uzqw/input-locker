@@ -41,6 +41,9 @@ Thumbs.db
 
 # Config (contains user password)
 config.json
+input-locker-plan.json
+input-locker-command.json
+input-locker-ack.json
 
 # PyInstaller
 *.spec

@@ -22,6 +22,8 @@ import time
 import threading
 import subprocess
 
+from locker_lifecycle import serialized
+
 from Xlib import X, display
 from Xlib.ext import xfixes
 
@@ -207,6 +209,13 @@ def _stop_inhibit(proc):
     if proc:
         try:
             proc.terminate()
+            proc.wait(timeout=3)  # 回收子进程，避免留下 zombie。
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -252,6 +261,7 @@ class LinuxInputLocker:
     """X11 会话后端：XGrabKeyboard/XGrabPointer 全局拦截，3x CapsLock 触发解锁。"""
 
     def __init__(self):
+        self._state_lock = threading.RLock()
         self.lock_active = False
         self.unlock_mode = False
         self._unlock_mode_changed = False
@@ -279,7 +289,12 @@ class LinuxInputLocker:
         self._on_submit = on_submit
 
     # ---- 锁定/解锁 ----
+    @serialized
     def start_lock(self):
+        if self.lock_active:
+            return True
+        if self._thread and self._thread.is_alive():
+            return False  # 上一代 worker 尚未退出，不可复用其共享状态。
         try:
             self.lock_active = True
             self.unlock_mode = False
@@ -292,29 +307,33 @@ class LinuxInputLocker:
             _usb_storage(False, self._usb_lock, self)
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
-            self._ready.wait(timeout=5)
+            if not self._ready.wait(timeout=5):
+                raise TimeoutError("输入抓取启动超时")
             if self._error:
                 raise self._error
-            return True
-        except Exception:
-            self.lock_active = False
-            _stop_inhibit(self._inhibit)
-            self._inhibit = None
-            _usb_storage(True, self._usb_lock, self)
+            return self.lock_active
+        except Exception as e:
+            self._error = e
+            self.stop_lock()
             return False
 
+    @serialized
     def stop_lock(self):
         try:
             self.unlock_mode = False
             self._unlock_mode_changed = False
             self.lock_active = False
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=3)
+                if self._thread.is_alive():
+                    self._error = TimeoutError("输入抓取线程尚未退出")
+                    return False
             _stop_inhibit(self._inhibit)
             self._inhibit = None
             _usb_storage(True, self._usb_lock, self)
-            if self._thread and self._thread.is_alive():
-                self._thread.join(timeout=3)
             return True
-        except Exception:
+        except Exception as e:
+            self._error = e
             return False
 
     def cancel_unlock_mode(self):
@@ -323,16 +342,7 @@ class LinuxInputLocker:
         self._unlock_mode_changed = True
 
     def emergency_restore(self):
-        self.lock_active = False
-        self.unlock_mode = False
-        _stop_inhibit(self._inhibit)
-        self._inhibit = None
-        _usb_storage(True, self._usb_lock, self)
-        try:
-            if self._thread and self._thread.is_alive():
-                self._thread.join(timeout=2)
-        except Exception:
-            pass
+        self.stop_lock()
 
     # ---- X11 抓取 ----
     def _worker(self):
@@ -373,6 +383,9 @@ class LinuxInputLocker:
             self._ready.set()
         finally:
             self._cleanup()
+            _stop_inhibit(self._inhibit)
+            self._inhibit = None
+            _usb_storage(True, self._usb_lock, self)
 
     def _cleanup(self):
         d = self._d
@@ -454,6 +467,7 @@ class EvdevLocker:
         self._caps_times = []
         self._pwd = ""
         self._shifted = False
+        self._state_lock = threading.RLock()
         self._devs = {}          # path -> InputDevice
         self._grab_error = None  # 权限/抓取失败原因（触发回退）
         self.usb_storage_skipped = False
@@ -469,8 +483,14 @@ class EvdevLocker:
         self._on_submit = on_submit
 
     # ---- 锁定/解锁 -------
+    @serialized
     def start_lock(self):
+        if self.lock_active:
+            return True
+        if self._thread and self._thread.is_alive():
+            return False  # 上一代 worker 尚未退出，不可复用其共享状态。
         if evdev is None:
+            self._error = RuntimeError("evdev 未安装")
             return False
         try:
             self.lock_active = True
@@ -486,31 +506,35 @@ class EvdevLocker:
             _usb_storage(False, self._usb_lock, self)
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
-            self._ready.wait(timeout=5)
+            if not self._ready.wait(timeout=5):
+                raise TimeoutError("输入抓取启动超时")
             if self._grab_error:
                 raise self._grab_error
             if self._error:
                 raise self._error
-            return True
-        except Exception:
-            self.lock_active = False
-            _stop_inhibit(self._inhibit)
-            self._inhibit = None
-            _usb_storage(True, self._usb_lock, self)
+            return self.lock_active
+        except Exception as e:
+            self._error = e
+            self.stop_lock()
             return False
 
+    @serialized
     def stop_lock(self):
         try:
             self.unlock_mode = False
             self._unlock_mode_changed = False
             self.lock_active = False
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=3)
+                if self._thread.is_alive():
+                    self._error = TimeoutError("输入抓取线程尚未退出")
+                    return False
             _stop_inhibit(self._inhibit)
             self._inhibit = None
             _usb_storage(True, self._usb_lock, self)
-            if self._thread and self._thread.is_alive():
-                self._thread.join(timeout=3)
             return True
-        except Exception:
+        except Exception as e:
+            self._error = e
             return False
 
     def cancel_unlock_mode(self):
@@ -519,16 +543,7 @@ class EvdevLocker:
         self._unlock_mode_changed = True
 
     def emergency_restore(self):
-        self.lock_active = False
-        self.unlock_mode = False
-        _stop_inhibit(self._inhibit)
-        self._inhibit = None
-        _usb_storage(True, self._usb_lock, self)
-        try:
-            if self._thread and self._thread.is_alive():
-                self._thread.join(timeout=2)
-        except Exception:
-            pass
+        self.stop_lock()
 
     # ---- 抓取主循环 ----
     def _open_devices(self):
@@ -553,9 +568,11 @@ class EvdevLocker:
                 grabbed[path] = dev
             except Exception as e:
                 dev.close()
+                for opened in grabbed.values():
+                    opened.close()
                 raise PermissionError(
-                    "无法抓取 %s (%s)：需要 root 或加入 input 组后重新登录"
-                    % (path, e))
+                    "无法抓取 %s (%s)：检查 input 组权限及设备是否被占用"
+                    % (path, e)) from e
         if not grabbed:
             raise RuntimeError("未找到可抓取的输入设备")
         return grabbed
@@ -585,6 +602,9 @@ class EvdevLocker:
                 except Exception:
                     pass
             self._devs.clear()
+            _stop_inhibit(self._inhibit)
+            self._inhibit = None
+            _usb_storage(True, self._usb_lock, self)
 
     def _handle_events(self):
         if not self._devs:
@@ -687,6 +707,8 @@ class WaylandLocker:
         self.unlock_password = _load_config().get("password", DEFAULT_PASSWORD)
         self._inhibit = None
         self._poll_thread = None
+        self._state_lock = threading.RLock()
+        self._error = None
         self._usb_lock = threading.Lock()
         self.usb_storage_skipped = False
 
@@ -702,37 +724,40 @@ class WaylandLocker:
             out = subprocess.run(
                 ["qdbus", "org.freedesktop.ScreenSaver", "/ScreenSaver",
                  "org.freedesktop.ScreenSaver.GetActive"],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=5, check=True)
             return out.stdout.strip() == "true"
         except Exception:
             return True
 
+    @serialized
     def start_lock(self):
+        if self.lock_active:
+            return True
         try:
+            self._error = None
             self.lock_active = True
             self._inhibit = _start_inhibit()
             _usb_storage(False, self._usb_lock, self)
-            subprocess.run(["loginctl", "lock-session"], timeout=10)
+            subprocess.run(["loginctl", "lock-session"], timeout=10, check=True)
             self._poll_thread = threading.Thread(target=self._poll, daemon=True)
             self._poll_thread.start()
             return True
-        except Exception:
-            self.lock_active = False
-            _stop_inhibit(self._inhibit)
-            self._inhibit = None
-            _usb_storage(True, self._usb_lock, self)
+        except Exception as e:
+            self._error = e
+            self.stop_lock()
             return False
 
     def _poll(self):
-        while self.lock_active:
-            try:
+        while True:
+            with self._state_lock:
+                if not self.lock_active or self._poll_thread is not threading.current_thread():
+                    return  # 旧的轮询线程不得解锁下一次启动的锁。
                 if not self._get_active():
                     self.stop_lock()
                     return
-            except Exception:
-                pass
             time.sleep(1)
 
+    @serialized
     def stop_lock(self):
         try:
             self.lock_active = False

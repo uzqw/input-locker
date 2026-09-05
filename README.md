@@ -109,6 +109,35 @@ cd input-locker
 >
 > Linux 下无需 root 即可锁定输入；**USB 存储禁用需要 root**（非 root 时自动跳过并在界面提示）。如需 USB 禁用，用 `sudo .venv/bin/python main.pyw` 运行。
 
+#### 4. 开机自动启动（可选）
+
+登录进桌面时自动启动（挂在 `graphical-session.target` 下，KDE Plasma 6 已自动把 `WAYLAND_DISPLAY` 等变量导入用户管理器，无需额外配置）：
+
+```bash
+cp input-locker.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable input-locker.service   # 下次登录自动启动
+systemctl --user disable input-locker.service  # 取消自启
+```
+
+> ⚠️ **不需要 `loginctl enable-linger`**：linger 是给无图形会话的后台服务的（开机即启动）；这是 GUI 应用，开机时没有显示服务器，启动会失败，且没桌面可锁。挂 `graphical-session.target` 会在登录、桌面就绪后才启动，才是正确时机。
+>
+> 更简单的替代：写一个 `~/.config/autostart/input-locker.desktop`（桌面环境自带自启机制），systemd 方案的优势是可用 `systemctl --user` 统一管理/看状态。
+
+## 计划 / MCP 命令回执
+
+- 已锁定时重复 `lock` 为成功的空操作；UI 与计划线程的锁定/解锁入口串行执行，不会重新抓取设备或覆盖现有 inhibit。
+- 命令格式：`{"cmd":"lock","id":"唯一命令ID"}`，也接受旧版不带 `id` 的命令。ack 原样回传 `id`，`result` 为 `ok` 或 `error`，失败时附 `error` 原因。`ok` 表示该次操作成功，不是持续锁定状态监测。
+- 消费者先把命令原子移动到 `.processing` 再执行，ack 原子写入；执行中收到的新命令不会被旧命令删除。
+- MCP 服务端必须核对 ack 的 `id` 与本次命令一致；更新协议时需同时更新并重启 input-locker 和 aide。
+- 重启前检查计划文件：已过期的 once 计划目前仍可能先锁再解锁，应先归档/移除过期任务，避免意外触发。
+
+无真实锁屏的回归检查（模拟设备、无需显示会话）：
+
+```bash
+.venv/bin/python -m unittest -v test_locker
+```
+
 ## 🔑 修改密码
 
 1. 点击主界面「修改密码」按钮
@@ -121,6 +150,8 @@ cd input-locker
 input-locker/
 ├── main.pyw          # 主程序（.pyw 无控制台窗口）
 ├── linux_locker.py   # Linux 后端（X11 抓取 / evdev 抓取 / Wayland 系统锁屏）
+├── locker_lifecycle.py # UI / 计划线程的生命周期互斥
+├── test_locker.py    # 模拟设备回归检查（不锁真实键鼠）
 ├── icon.ico          # EXE 应用图标
 ├── build.ps1         # PowerShell 打包脚本
 ├── requirements.txt  # Python 依赖

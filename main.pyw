@@ -9,6 +9,7 @@ import os
 import datetime
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
+from locker_lifecycle import serialized
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -138,6 +139,7 @@ if IS_WINDOWS:
 
 class InputLocker:
     def __init__(self):
+        self._state_lock = threading.RLock()
         self.kb_hook_handle = None
         self.mouse_hook_handle = None
         self.lock_active = False
@@ -344,7 +346,12 @@ class InputLocker:
             except Exception:
                 pass
 
+    @serialized
     def start_lock(self):
+        if self.lock_active:
+            return True
+        if self._msg_thread and self._msg_thread.is_alive():
+            return False
         try:
             self.lock_active = True
             self.unlock_mode = False
@@ -361,18 +368,21 @@ class InputLocker:
             self._msg_thread = threading.Thread(target=self._lock_worker, daemon=True)
             self._msg_thread.start()
             # 等钩子装好或失败（最多 5 秒），确认锁定真正生效
-            self._lock_ready.wait(timeout=5)
+            if not self._lock_ready.wait(timeout=5):
+                raise TimeoutError("输入钩子启动超时")
             if self._lock_error:
                 raise self._lock_error
             if not self.kb_hook_handle and not self.mouse_hook_handle:
                 raise RuntimeError("hooks not installed")
             return True
-        except Exception:
+        except Exception as e:
+            self._lock_error = e
             # 标记退出，worker 线程的 finally 会自清理；这里不重复恢复系统状态
             self.lock_active = False
             self._lock_ready.set()
             return False
 
+    @serialized
     def stop_lock(self):
         try:
             self.unlock_mode = False
@@ -384,6 +394,9 @@ class InputLocker:
             if self._msg_thread and self._msg_thread.is_alive():
                 user32.PostThreadMessageW(self._msg_thread.ident, 0x0012, 0, 0)
                 self._msg_thread.join(timeout=3)
+                if self._msg_thread.is_alive():
+                    self._lock_error = TimeoutError("输入钩子线程尚未退出")
+                    return False
             # worker 的 finally 已卸钩子并恢复系统；这里兜底再恢复一次（幂等）
             self._enable_usb_storage()
             self._restore_screen_settings()
@@ -396,6 +409,7 @@ class InputLocker:
         self.unlock_mode = False
         self._unlock_mode_changed = True
 
+    @serialized
     def emergency_restore(self):
         self.lock_active = False
         self.unlock_mode = False
@@ -424,7 +438,8 @@ class InputLocker:
 class ScheduleWatcher:
     """读取计划JSON + 命令文件：命中锁定/解锁条件则自动执行。
     计划任务结构：{mode, when(锁定条件), unlock(解锁条件), confirm}。
-    命令文件：{"cmd": "lock"|"unlock"}，执行后删除并写 ack 文件。
+    命令文件：{"cmd": "lock"|"unlock", "id": "唯一命令ID"}；ack 回传 id 与实际结果。
+    旧命令可不带 id。先认领命令再执行，避免删除执行期间新到的命令。
     """
     def __init__(self, locker, file_var, status_cb, command_file, ack_file):
         self.locker = locker
@@ -435,8 +450,12 @@ class ScheduleWatcher:
         self._fired = {}  # (action, idx, date) -> date，防同一天重复触发
         self._stop = False
 
+    def _plan_path(self):
+        path = load_config().get("schedule_file") or self.file_var
+        return path if path else ""
+
     def _load_tasks(self):
-        path = self.file_var
+        path = self._plan_path()
         if not path or not os.path.isfile(path):
             return []
         try:
@@ -465,13 +484,21 @@ class ScheduleWatcher:
         ok = self.locker.start_lock()
         confirm = task.get("confirm", "")
         msg = ("计划触发自动锁定" if ok else "自动锁定失败") + (f"：{confirm}" if confirm else "")
-        self.status_cb(msg, ok)
+        try:
+            self.status_cb(msg, ok)
+        except Exception:
+            traceback.print_exc()  # UI 更新失败不能掩盖实际锁定结果。
+        return ok
 
     def _do_unlock(self, task):
         ok = self.locker.stop_lock()
         confirm = task.get("confirm", "")
         msg = ("计划触发自动解锁" if ok else "自动解锁失败") + (f"：{confirm}" if confirm else "")
-        self.status_cb(msg, ok)
+        try:
+            self.status_cb(msg, ok)
+        except Exception:
+            traceback.print_exc()
+        return ok
 
     def _check_plan(self, now):
         for i, t in enumerate(self._load_tasks()):
@@ -494,33 +521,57 @@ class ScheduleWatcher:
                     return
 
     def _check_command(self):
-        if not self.command_file or not os.path.isfile(self.command_file):
+        plan = self._plan_path()
+        d = os.path.dirname(plan) if plan else ""
+        command_file = os.path.join(d, "input-locker-command.json") if d else self.command_file
+        ack_file = os.path.join(d, "input-locker-ack.json") if d else self.ack_file
+        if not command_file:
             return
+        processing = command_file + ".processing"
         try:
-            with open(self.command_file, "r", encoding="utf-8") as f:
+            os.replace(command_file, processing)
+        except FileNotFoundError:
+            return
+        except OSError:
+            traceback.print_exc()
+            return
+        cmd = {}
+        action = None
+        result = "error"
+        error = ""
+        try:
+            with open(processing, "r", encoding="utf-8") as f:
                 cmd = json.load(f)
+            if not isinstance(cmd, dict):
+                raise ValueError("命令必须是 JSON 对象")
             action = cmd.get("cmd")
-            result = "ok"
             if action == "lock":
-                self._do_lock(cmd)
+                ok = self._do_lock(cmd)
             elif action == "unlock":
-                self._do_unlock(cmd)
+                ok = self._do_unlock(cmd)
             else:
-                result = "bad cmd: " + str(action)
-            try:
-                os.remove(self.command_file)
-            except Exception:
-                pass
-            if self.ack_file:
-                try:
-                    with open(self.ack_file, "w", encoding="utf-8") as f:
-                        json.dump({"cmd": action, "result": result,
-                                   "ts": datetime.datetime.now().isoformat()}, f,
-                                  ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                raise ValueError("bad cmd: " + str(action))
+            if ok:
+                result = "ok"
+            else:
+                cause = getattr(self.locker, "_error", None) or getattr(self.locker, "_lock_error", None)
+                error = str(cause or (str(action) + " failed"))
+        except Exception as e:
+            error = str(e)
+        ack = {"cmd": action, "result": result,
+               "ts": datetime.datetime.now().isoformat()}
+        if isinstance(cmd, dict) and "id" in cmd:
+            ack["id"] = cmd["id"]
+        if error:
+            ack["error"] = error
+        try:
+            if ack_file:
+                with open(ack_file + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(ack, f, ensure_ascii=False, indent=2)
+                os.replace(ack_file + ".tmp", ack_file)
+            os.remove(processing)
+        except OSError:
+            traceback.print_exc()
 
     def run(self):
         while not self._stop:
