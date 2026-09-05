@@ -4,7 +4,7 @@
 
 > ⬇️ **[下载最新版 InputLocker.exe](https://github.com/he-zhiyuan/input-locker/releases/latest)**
 
-Windows / Linux 输入设备锁定工具。适用于笔记本电脑的展示/防误触场景，锁定后键盘、鼠标禁用，USB存储禁用，屏幕保持常亮，通过 CapsLock+密码解锁。
+Windows / Linux / macOS 输入设备锁定工具。适用于笔记本电脑的展示/防误触场景，锁定后键盘、鼠标禁用，屏幕保持常亮，通过 CapsLock+密码解锁。Windows / Linux 还可禁用 USB 存储。
 
 ## ✨ 功能
 
@@ -12,9 +12,9 @@ Windows / Linux 输入设备锁定工具。适用于笔记本电脑的展示/防
 |------|------|
 | ⌨️ 键盘锁定 | 禁用所有按键，仅放行 CapsLock（触发解锁）和字母/数字键（输入密码） |
 | 🖱️ 鼠标锁定 | 锁定期间全程禁用，光标隐藏，解锁模式下同样不可用 |
-| 💾 USB存储禁用 | 禁用U盘等USB存储设备（不影响笔记本自带键盘/触控板） |
+| 💾 USB存储禁用 | 禁用U盘等USB存储设备（不影响笔记本自带键盘/触控板；macOS 不支持） |
 | 💡 屏幕常亮 | 禁用屏保和自动息屏 |
-| 🛡️ 防杀后台 | 阻止系统休眠（Windows: `SetThreadExecutionState`；Linux: `systemd-inhibit`） |
+| 🛡️ 防杀后台 | 阻止系统休眠（Windows: `SetThreadExecutionState`；Linux: `systemd-inhibit`；macOS: `caffeinate`） |
 | 🔑 密码保护 | 支持修改密码，持久化保存到 config.json |
 | 🔄 崩溃恢复 | 注册 `atexit` 回调，程序异常退出时自动恢复系统设置 |
 
@@ -31,7 +31,7 @@ Windows / Linux 输入设备锁定工具。适用于笔记本电脑的展示/防
 - 👻 锁定期间屏幕光标暂时隐藏，解锁后恢复原状态
 - ❌ 密码错误自动关闭解锁模式，需重新触发
 
-> 💡 Windows 与 Linux（X11 / 有 input 权限的 Wayland）解锁流程相同，均为上述自定义密码流程；
+> 💡 Windows、Linux（X11 / 有 input 权限的 Wayland）与 macOS 解锁流程相同，均为上述自定义密码流程；
 > 仅当 Wayland 无 input 权限回退到系统锁屏时，才改用系统密码在锁屏界面解锁。
 
 ## 🚀 使用方法
@@ -124,6 +124,41 @@ systemctl --user disable input-locker.service  # 取消自启
 >
 > 更简单的替代：写一个 `~/.config/autostart/input-locker.desktop`（桌面环境自带自启机制），systemd 方案的优势是可用 `systemctl --user` 统一管理/看状态。
 
+### macOS
+
+#### 1. 安装依赖
+
+```bash
+cd input-locker
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+#### 2. 授予辅助功能权限（必需）
+
+系统设置 → 隐私与安全性 → 辅助功能，允许运行本程序的 **Terminal / python3 / IDE**。
+首次锁定时系统可能弹出授权提示；**未授权时锁定会失败**（不会假装成功）。
+
+#### 3. 启动
+
+在图形桌面会话里启动（本机 Terminal 或屏幕共享）。纯 SSH 通常没有 GUI，也无法完成辅助功能授权：
+
+```bash
+cd input-locker
+.venv/bin/python main.pyw
+```
+
+默认计划文件：`~/Downloads/input-locker-plan.json`（与 Linux 相同）。
+
+后端：`MacInputLocker`（`CGEventTap` 过滤键鼠）。解锁流程与 Windows / Linux-evdev 相同：2 秒内连按 3 次 CapsLock，输入自定义密码，Enter 提交。屏幕常亮用 `caffeinate -dimsu`，光标用 `CGDisplayHideCursor`。
+
+#### 限制
+
+- **无 USB 存储禁用**（macOS 没有对等的廉价实现）。
+- 若在系统设置里把 CapsLock 改成了其他键，3× CapsLock 解锁不会触发。
+- 无系统锁屏回退。
+- SSH 会话通常没有事件轻击 / GUI；远程检查以 `python -m unittest -v test_locker` 和 import 探测为准。
+
 ## 计划 / MCP 命令回执
 
 - 已锁定时重复 `lock` 为成功的空操作；UI 与计划线程的锁定/解锁入口串行执行，不会重新抓取设备或覆盖现有 inhibit。
@@ -150,6 +185,7 @@ systemctl --user disable input-locker.service  # 取消自启
 input-locker/
 ├── main.pyw          # 主程序（.pyw 无控制台窗口）
 ├── linux_locker.py   # Linux 后端（X11 抓取 / evdev 抓取 / Wayland 系统锁屏）
+├── macos_locker.py   # macOS 后端（CGEventTap）
 ├── locker_lifecycle.py # UI / 计划线程的生命周期互斥
 ├── test_locker.py    # 模拟设备回归检查（不锁真实键鼠）
 ├── icon.ico          # EXE 应用图标
@@ -162,7 +198,7 @@ input-locker/
 
 ## ⚠️ 注意事项
 
-- 🏷️ **Windows 必须以管理员身份运行**；Linux 无需 root（USB 禁用除外）
+- 🏷️ **Windows 必须以管理员身份运行**；Linux 无需 root（USB 禁用除外）；macOS 需要辅助功能权限，无需 root
 - 💻 本程序专为笔记本电脑设计（自带键盘非 USB，可安全禁用 USB 存储）
 - ⚡ Windows 下 Ctrl+Alt+Del 是安全序列，低级键盘钩子无法拦截，始终可用作紧急手段；Linux X11 下杀掉进程即可释放抓取（X 服务器会自动解除）
 - 🔌 USB存储禁用仅影响 USB 大容量存储设备（U盘等），不影响笔记本自带键盘/触控板

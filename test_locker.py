@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import linux_locker as backend
+import macos_locker
 
 loader = importlib.machinery.SourceFileLoader('locker_app', str(Path(__file__).with_name('main.pyw')))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -211,13 +212,149 @@ class LockerTests(unittest.TestCase):
         self.assertEqual(self.inhibitors, [])
 
     def test_other_backends_already_locked_are_noops(self):
-        for cls in (backend.LinuxInputLocker, backend.WaylandLocker, app.InputLocker):
+        for cls in (backend.LinuxInputLocker, backend.WaylandLocker,
+                    app.InputLocker, macos_locker.MacInputLocker):
             with self.subTest(backend=cls.__name__):
                 locker = cls()
                 locker.lock_active = True
-                with patch.object(backend, '_start_inhibit') as inhibit:
+                with patch.object(backend, '_start_inhibit') as inhibit, \
+                     patch.object(macos_locker, '_is_trusted') as trusted, \
+                     patch.object(macos_locker, '_start_caffeinate') as caff:
                     self.assertTrue(locker.start_lock())
                     inhibit.assert_not_called()
+                    trusted.assert_not_called()
+                    caff.assert_not_called()
+
+
+class MacLockerTests(unittest.TestCase):
+    def setUp(self):
+        self.locker = macos_locker.MacInputLocker()
+        self.addCleanup(self.locker.stop_lock)
+        self.inhibitors = []
+        def caffeinate():
+            proc = Mock()
+            self.inhibitors.append(proc)
+            return proc
+        for context in (
+            patch.object(macos_locker, '_is_trusted', return_value=True),
+            patch.object(macos_locker, '_start_caffeinate', caffeinate),
+            patch.object(macos_locker, '_stop_caffeinate'),
+        ):
+            context.start()
+            self.addCleanup(context.stop)
+        self.locker._install_tap = lambda: None
+        self.locker._hide_cursor = lambda: setattr(self.locker, '_cursor_hidden', True)
+        self.locker._run_loop = lambda: self._spin()
+        orig_cleanup = self.locker._cleanup
+        def cleanup():
+            self.locker._show_cursor()
+            orig_cleanup()
+        self.locker._cleanup = cleanup
+
+    def _spin(self):
+        while self.locker.lock_active:
+            time.sleep(0.005)
+
+    def test_untrusted_and_missing_caffeinate_fail_visibly(self):
+        with patch.object(macos_locker, '_is_trusted', return_value=False):
+            self.assertFalse(self.locker.start_lock())
+        self.assertFalse(self.locker.lock_active)
+        self.assertEqual(self.inhibitors, [])
+        with patch.object(macos_locker, '_start_caffeinate', return_value=None):
+            self.assertFalse(self.locker.start_lock())
+        self.assertFalse(self.locker.lock_active)
+
+    def test_tap_failure_and_timeout_restore_and_block_restart(self):
+        self.locker._install_tap = Mock(side_effect=RuntimeError('tap null'))
+        self.assertFalse(self.locker.start_lock())
+        self.assertFalse(self.locker.lock_active)
+        self.assertFalse(self.locker._cursor_hidden)
+        macos_locker._stop_caffeinate.assert_called()
+        worker = Mock()
+        worker.is_alive.return_value = True
+        with patch.object(macos_locker.threading, 'Thread', return_value=worker), \
+             patch.object(self.locker._ready, 'wait', return_value=False):
+            self.assertFalse(self.locker.start_lock())
+            self.assertFalse(self.locker.start_lock())
+        worker.start.assert_called_once()
+        worker.is_alive.return_value = False
+
+    def test_lock_stop_and_caps_password_submit(self):
+        self.assertTrue(self.locker.start_lock())
+        self.assertTrue(self.locker.lock_active)
+        self.assertEqual(len(self.inhibitors), 1)
+        seen = []
+        self.locker.set_ui_callbacks(
+            on_password=lambda p: seen.append(('p', p)),
+            on_submit=lambda p: seen.append(('s', p)),
+        )
+        off, on = 0, macos_locker.kCGEventFlagMaskAlphaShift
+        caps = macos_locker.kVK_CapsLock
+        for _ in range(3):
+            self.locker._handle(macos_locker.kCGEventFlagsChanged, off, caps)
+            self.locker._handle(macos_locker.kCGEventFlagsChanged, on, caps)
+        self.assertTrue(self.locker.unlock_mode)
+        self.locker._handle(macos_locker.kCGEventKeyDown, 0, 0, 'a')
+        self.locker._handle(macos_locker.kCGEventKeyDown, 0, macos_locker.kVK_Delete)
+        self.locker._handle(macos_locker.kCGEventKeyDown, 0, 0, 'b')
+        self.locker._handle(macos_locker.kCGEventKeyDown, 0, macos_locker.kVK_Return)
+        self.assertEqual(seen, [('p', 'a'), ('p', ''), ('p', 'b'), ('s', 'b')])
+        self.assertTrue(self.locker.stop_lock())
+        self.assertFalse(self.locker.lock_active)
+        self.assertFalse(self.locker._cursor_hidden)
+
+    def test_disabled_tap_reenables_or_stops(self):
+        event = object()
+        self.locker._tap = object()
+        self.locker._q = Mock()
+        self.locker._q.CGEventTapIsEnabled.return_value = True
+        self.assertIs(
+            self.locker._tap_callback(
+                None, macos_locker.kCGEventTapDisabledByTimeout, event, None),
+            event,
+        )
+        self.locker._q.CGEventTapEnable.assert_called_once_with(self.locker._tap, True)
+        self.locker.lock_active = True
+        self.locker._q.CGEventTapIsEnabled.return_value = False
+        self.locker._tap_callback(
+            None, macos_locker.kCGEventTapDisabledByUserInput, event, None)
+        self.assertFalse(self.locker.lock_active)
+
+    def test_swallow_keys_and_concurrent_start(self):
+        self.locker._q = Mock()
+        self.locker._q.CGEventGetFlags.return_value = 0
+        self.locker._q.CGEventGetIntegerValueField.return_value = 0
+        self.locker._q.CGEventKeyboardGetUnicodeString = lambda *a: None
+        self.assertIsNone(
+            self.locker._tap_callback(None, macos_locker.kCGEventKeyDown, 1, None))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.locker.start_lock(), range(16)))
+        self.assertTrue(all(results))
+        self.assertEqual(len(self.inhibitors), 1)
+
+    def test_main_factory_darwin_and_unknown(self):
+        fake = Mock()
+        lockapp = Mock()
+        lockapp.return_value.run = Mock()
+        with patch.multiple(app, IS_WINDOWS=False, IS_LINUX=False, IS_DARWIN=True), \
+             patch.object(app.atexit, 'register'), \
+             patch.object(macos_locker, 'MacInputLocker', return_value=fake), \
+             patch.object(app, 'LockApp', lockapp), \
+             patch.object(app, 'InputLocker') as windows:
+            app.main()
+            macos_locker.MacInputLocker.assert_called_once_with()
+            lockapp.assert_called_once_with(fake, False)
+            windows.assert_not_called()
+        with patch.multiple(app, IS_WINDOWS=False, IS_LINUX=False, IS_DARWIN=False), \
+             patch.object(app, 'messagebox'), \
+             patch.object(app.sys, 'exit', side_effect=SystemExit(1)) as exited, \
+             patch.object(app, 'InputLocker') as windows, \
+             patch.object(app, 'LockApp') as lockapp2:
+            with self.assertRaises(SystemExit):
+                app.main()
+            windows.assert_not_called()
+            lockapp2.assert_not_called()
+            exited.assert_called_once_with(1)
 
 
 if __name__ == '__main__':

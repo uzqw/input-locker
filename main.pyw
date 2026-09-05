@@ -13,6 +13,7 @@ from locker_lifecycle import serialized
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
+IS_DARWIN = sys.platform == "darwin"
 IS_WAYLAND = IS_LINUX and (
     os.environ.get("XDG_SESSION_TYPE") == "wayland"
     or bool(os.environ.get("WAYLAND_DISPLAY"))
@@ -58,7 +59,7 @@ if os.environ.get("USERPROFILE"):
     DEFAULT_PLAN_FILE = os.path.join(
         os.environ["USERPROFILE"], "Downloads", "input-locker-plan.json"
     )
-elif IS_LINUX:
+elif IS_LINUX or IS_DARWIN:
     DEFAULT_PLAN_FILE = os.path.expanduser("~/Downloads/input-locker-plan.json")
 else:
     DEFAULT_PLAN_FILE = ""
@@ -709,7 +710,7 @@ class LockApp:
 
     def _choose_schedule_file(self):
         initial = os.path.dirname(self.schedule_file_var) if self.schedule_file_var else \
-            (os.path.expanduser("~/Downloads") if IS_LINUX
+            (os.path.expanduser("~/Downloads") if (IS_LINUX or IS_DARWIN)
              else os.path.join(os.environ.get("USERPROFILE", ""), "Downloads"))
         path = filedialog.askopenfilename(
             title="选择计划文件",
@@ -1044,6 +1045,7 @@ def _make_linux_locker():
 
 
 def main():
+    wayland_fallback = False
     if IS_WINDOWS:
         if not ctypes.windll.shell32.IsUserAnAdmin():
             executable = sys.executable
@@ -1058,8 +1060,16 @@ def main():
         locker = InputLocker()
     elif IS_LINUX:
         locker, wayland_fallback = _make_linux_locker()
+    elif IS_DARWIN:
+        from macos_locker import MacInputLocker
+        locker = MacInputLocker()
     else:
-        locker = InputLocker()
+        msg = "不支持的系统: %s" % sys.platform
+        try:
+            messagebox.showerror("错误", msg)
+        except Exception:
+            sys.stderr.write(msg + "\n")
+        sys.exit(1)
 
     atexit.register(locker.emergency_restore)
     app = LockApp(locker, wayland_fallback)
