@@ -133,6 +133,14 @@ def _bind(cg, cf):
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
     ]
     cf.CFDictionaryCreate.restype = ctypes.c_void_p
+    cf.CFDictionaryCreate.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_long,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
 
 
 def _libs():
@@ -157,17 +165,31 @@ def _ax_lib():
     raise RuntimeError("无法加载辅助功能 API") from last
 
 
+def _cf_type_dict_callbacks(cf):
+    # Symbol is the callback struct, not a pointer. NULL callbacks store raw
+    # pointers and skip retain — releasing the key then SIGSEGVs in AX.
+    return (
+        ctypes.c_void_p(ctypes.addressof(
+            ctypes.c_char.in_dll(cf, "kCFTypeDictionaryKeyCallBacks"))),
+        ctypes.c_void_p(ctypes.addressof(
+            ctypes.c_char.in_dll(cf, "kCFTypeDictionaryValueCallBacks"))),
+    )
+
+
 def _ax_prompt_options(cf):
     key = cf.CFStringCreateWithCString(
         None, b"AXTrustedCheckOptionPrompt", kCFStringEncodingUTF8
     )
-    true = _cf_symbol(cf, "kCFBooleanTrue")
-    keys = (ctypes.c_void_p * 1)(key)
-    vals = (ctypes.c_void_p * 1)(true)
-    opts = cf.CFDictionaryCreate(None, keys, vals, 1, None, None)
-    if key:
+    if not key:
+        return None
+    try:
+        true = _cf_symbol(cf, "kCFBooleanTrue")
+        keys = (ctypes.c_void_p * 1)(key)
+        vals = (ctypes.c_void_p * 1)(true)
+        kcb, vcb = _cf_type_dict_callbacks(cf)
+        return cf.CFDictionaryCreate(None, keys, vals, 1, kcb, vcb)
+    finally:
         cf.CFRelease(key)
-    return opts
 
 
 def _is_trusted(prompt=True):

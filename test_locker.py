@@ -1,6 +1,7 @@
 """Safe regression checks: fake input devices/inhibitors, no GUI or real lock.
 Run: .venv/bin/python -m unittest -v test_locker
 """
+import ctypes
 import datetime
 import importlib.machinery
 import importlib.util
@@ -355,6 +356,53 @@ class MacLockerTests(unittest.TestCase):
             windows.assert_not_called()
             lockapp2.assert_not_called()
             exited.assert_called_once_with(1)
+
+
+class MacAxPromptTests(unittest.TestCase):
+    def test_bind_sets_dictionary_create_argtypes(self):
+        cg, cf = Mock(), Mock()
+        macos_locker._bind(cg, cf)
+        self.assertEqual(len(cf.CFDictionaryCreate.argtypes), 6)
+        self.assertIs(cf.CFDictionaryCreate.argtypes[3], ctypes.c_long)
+        self.assertIs(cf.CFDictionaryCreate.argtypes[4], ctypes.c_void_p)
+        self.assertIs(cf.CFDictionaryCreate.argtypes[5], ctypes.c_void_p)
+
+    def test_ax_prompt_options_uses_cf_type_callbacks_then_releases_key(self):
+        order = []
+        cf = Mock()
+        cf.CFStringCreateWithCString.return_value = 0x1001
+        kcb, vcb = ctypes.c_void_p(0x2001), ctypes.c_void_p(0x2002)
+
+        def create(allocator, keys, vals, n, got_kcb, got_vcb):
+            order.append(('create', keys[0], vals[0], n, got_kcb, got_vcb))
+            return 0x3001
+
+        cf.CFDictionaryCreate.side_effect = create
+        cf.CFRelease.side_effect = lambda x: order.append(('release', x))
+        with patch.object(macos_locker, '_cf_symbol', return_value=ctypes.c_void_p(0x1002)), \
+             patch.object(macos_locker, '_cf_type_dict_callbacks', return_value=(kcb, vcb)):
+            opts = macos_locker._ax_prompt_options(cf)
+        self.assertEqual(opts, 0x3001)
+        self.assertEqual(order[0][0], 'create')
+        self.assertEqual(order[0][1], 0x1001)
+        self.assertEqual(order[0][3], 1)
+        self.assertEqual(order[0][4], kcb)
+        self.assertEqual(order[0][5], vcb)
+        self.assertIsNotNone(order[0][4])
+        self.assertIsNotNone(order[0][5])
+        self.assertEqual(order[1], ('release', 0x1001))
+
+    def test_is_trusted_prompt_releases_options(self):
+        ax = Mock()
+        ax.AXIsProcessTrusted.return_value = False
+        ax.AXIsProcessTrustedWithOptions.return_value = False
+        cf = Mock()
+        with patch.object(macos_locker, '_ax_lib', return_value=ax), \
+             patch.object(macos_locker, '_libs', return_value=(None, cf)), \
+             patch.object(macos_locker, '_ax_prompt_options', return_value=0x4001):
+            self.assertFalse(macos_locker._is_trusted(prompt=True))
+        ax.AXIsProcessTrustedWithOptions.assert_called_once_with(0x4001)
+        cf.CFRelease.assert_called_once_with(0x4001)
 
 
 if __name__ == '__main__':
