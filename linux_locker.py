@@ -21,6 +21,7 @@ import sys
 import time
 import threading
 import subprocess
+import tempfile
 
 from locker_lifecycle import serialized
 
@@ -58,7 +59,7 @@ CAPS_TRIGGER_WINDOW = 2.0
 DEFAULT_PASSWORD = "123456"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "config.json")
 
-USB_RULE = "/etc/udev/rules.d/99-input-locker-usb.rules"
+USB_RULE = os.environ.get("USB_RULE_PATH", "/etc/udev/rules.d/99-input-locker-usb.rules")
 USB_RULE_CONTENT = (
     'ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="08", '
     'RUN+="/bin/sh -c \'echo 0 > /sys$env{DEVPATH}/../authorized\'"\n'
@@ -258,11 +259,17 @@ def _usb_storage(enable, lock, locker):
     def worker():
         with lock:
             try:
-                path = "/tmp/input-locker-usb.sh"
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(_usb_script(enable))
-                os.chmod(path, 0o755)
-                subprocess.run(["sh", path], timeout=15)
+                fd, path = tempfile.mkstemp(prefix="input-locker-usb-", suffix=".sh")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(_usb_script(enable))
+                    os.chmod(path, 0o755)
+                    subprocess.run(["sh", path], timeout=15)
+                finally:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
             except Exception:
                 pass
     threading.Thread(target=worker, daemon=True).start()

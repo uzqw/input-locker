@@ -9,7 +9,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h//path/to/input-locker/.venv/bin/python %h//path/to/input-locker/main.pyw
+# 部署时把启动包装脚本装到 ~/.local/bin/input-locker（见 README），避免写死仓库绝对路径
+ExecStart=%h/.local/bin/input-locker
 Restart=on-failure
 RestartSec=5
 

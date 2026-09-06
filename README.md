@@ -44,7 +44,21 @@ python3 -m venv .venv
 .venv/bin/python main.pyw
 ```
 
-USB 禁用需要 root：`sudo .venv/bin/python main.pyw`。可选自启：把 `input-locker.service` 拷到 `~/.config/systemd/user/` 后 `systemctl --user enable --now input-locker.service`。
+USB 禁用需要 root：`sudo .venv/bin/python main.pyw`。可选自启：先建启动包装脚本，再拷 service 文件：
+
+```bash
+# 启动包装脚本（service 用 %h/.local/bin/input-locker，不写死仓库路径）
+cat > ~/.local/bin/input-locker <<'EOF'
+#!/bin/sh
+exec "$HOME/input-locker/.venv/bin/python" "$HOME/input-locker/main.pyw"
+EOF
+chmod +x ~/.local/bin/input-locker
+# 把仓库里的 input-locker.service 拷到用户 systemd 目录后启用
+cp input-locker.service ~/.config/systemd/user/
+systemctl --user enable --now input-locker.service
+```
+
+> 上面 `$HOME/input-locker` 是示例，请改成你实际的仓库路径。
 
 **macOS**：系统设置 → 隐私与安全性 → 辅助功能，允许 Terminal / python3，然后：
 
