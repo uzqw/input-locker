@@ -19,6 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pi-web/
 
 # Virtual Environment
 venv/
