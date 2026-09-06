@@ -59,7 +59,7 @@ CAPS_TRIGGER_WINDOW = 2.0
 DEFAULT_PASSWORD = "123456"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "config.json")
 
-USB_RULE = os.environ.get("USB_RULE_PATH", "/etc/udev/rules.d/99-input-locker-usb.rules")
+USB_RULE = "/etc/udev/rules.d/99-input-locker-usb.rules"
 USB_RULE_CONTENT = (
     'ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="08", '
     'RUN+="/bin/sh -c \'echo 0 > /sys$env{DEVPATH}/../authorized\'"\n'
