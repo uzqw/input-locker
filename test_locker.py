@@ -116,6 +116,80 @@ class LockerTests(unittest.TestCase):
         self.watcher._check_plan(now + datetime.timedelta(hours=1, minutes=15))
         self.assertFalse(self.locker.lock_active)
 
+    def test_expired_plan_before_new_plan_does_not_block(self):
+        """Regression: expired plan before new plan must not block the new one.
+        (old bug: iterating to an expired once plan returned early, so the
+        new plan behind it never fired)"""
+        now = datetime.datetime.fromisoformat('2026-09-05T10:12:00+08:00')
+        self.plan.write_text(json.dumps([
+            dict(mode='once', when=dict(at='2026-09-05T09:00:00+08:00'),
+                 unlock=dict(at='2026-09-05T09:10:00+08:00')),  # expired, first
+            dict(mode='once', when=dict(at='2026-09-05T10:06:03+08:00'),
+                 unlock=dict(at='2026-09-05T10:16:03+08:00')),  # new plan
+        ]))
+        self.watcher._check_plan(now)
+        self.assertTrue(self.locker.lock_active)
+        self.locker._open_devices.assert_called_once()
+
+    def test_expired_plan_does_not_unlock_active_lock(self):
+        """Regression: after locking, an expired plan (unlock in the past)
+        must not unlock the active lock. (old bug: expired unlock_due fired
+        _do_unlock, so the lock was released right after being taken)"""
+        now = datetime.datetime.fromisoformat('2026-09-05T10:12:00+08:00')
+        # new plan triggers the lock first
+        self.plan.write_text(json.dumps([dict(mode='once',
+            when=dict(at='2026-09-05T10:06:03+08:00'),
+            unlock=dict(at='2026-09-05T10:16:03+08:00'))]))
+        self.watcher._check_plan(now)
+        self.assertTrue(self.locker.lock_active)
+        # plan file gets overwritten: expired plan inserted before current one
+        self.plan.write_text(json.dumps([
+            dict(mode='once', when=dict(at='2026-09-05T09:00:00+08:00'),
+                 unlock=dict(at='2026-09-05T09:10:00+08:00')),  # expired
+            dict(mode='once', when=dict(at='2026-09-05T10:06:03+08:00'),
+                 unlock=dict(at='2026-09-05T10:16:03+08:00')),  # current
+        ]))
+        self.watcher._check_plan(now + datetime.timedelta(seconds=1))
+        self.assertTrue(self.locker.lock_active)  # expired plan must not unlock
+        # due time: must unlock
+        self.watcher._check_plan(now + datetime.timedelta(minutes=5))
+        self.assertFalse(self.locker.lock_active)
+
+    def test_mixed_plan_chaos_keeps_invariant(self):
+        """Chaos: random mix of expired/future/current plans, invariant check:
+        once locked, no expired plan may unlock; the current plan must unlock
+        at its due time."""
+        import random
+        rng = random.Random(42)
+        base = datetime.datetime.fromisoformat('2026-09-05T10:12:00+08:00')
+        for trial in range(20):
+            tasks = []
+            for _ in range(rng.randint(0, 4)):
+                past = base - datetime.timedelta(minutes=rng.randint(30, 300))
+                tasks.append(dict(mode='once',
+                    when=dict(at=(past).isoformat()),
+                    unlock=dict(at=(past + datetime.timedelta(minutes=10)).isoformat())))
+            tasks.append(dict(mode='once',
+                when=dict(at='2026-09-05T10:06:03+08:00'),
+                unlock=dict(at='2026-09-05T10:16:03+08:00')))
+            rng.shuffle(tasks)
+            self.plan.write_text(json.dumps(tasks))
+            # lock time: must lock
+            self.watcher._check_plan(base)
+            self.assertTrue(self.locker.lock_active,
+                            'trial %d: new plan blocked by expired plans' % trial)
+            # 1s after lock: expired plans must not unlock
+            self.watcher._check_plan(base + datetime.timedelta(seconds=1))
+            self.assertTrue(self.locker.lock_active,
+                            'trial %d: expired plan unlocked active lock' % trial)
+            # unlock time: must unlock
+            self.watcher._check_plan(base + datetime.timedelta(minutes=5))
+            self.assertFalse(self.locker.lock_active,
+                             'trial %d: current plan did not unlock' % trial)
+            # reset for next trial
+            self.locker.stop_lock()
+            self.watcher._fired.clear()
+
     def test_concurrent_lock_calls_start_one_worker(self):
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda _: self.locker.start_lock(), range(16)))

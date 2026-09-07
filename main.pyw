@@ -534,27 +534,33 @@ class ScheduleWatcher:
             when = t.get("when") or {}
             unlock = t.get("unlock") or {}
             today = now.strftime("%Y-%m-%d")
-            # once 任务用 at 时间做防重 key（只触发一次），recurring 用日期（每天一次）
-            lock_key = ("lock", i, when.get("at") if mode == "once" else today)
-            unlock_key = ("unlock", i, unlock.get("at") if mode == "once" else today)
+            # once 任务用 at 做防重 key（不用数组下标——aide 每次写计划会
+            # append/清理，下标会漂移导致本进程“锁过这条”的标记失效）；
+            # recurring 用日期（每天一次）
+            if mode == "once":
+                lock_key = ("lock", when.get("at"))
+                unlock_key = ("unlock", unlock.get("at"))
+            else:
+                lock_key = ("lock", today)
+                unlock_key = ("unlock", today)
             lock_due = self._match(when, mode, now)
             unlock_due = self._match(unlock, mode, now)
             if mode == "once" and unlock_due:
                 # 过期 once 不再上锁；只有本进程锁过这条才解锁，避免误解后面那条。
-                if (self._fired.get(lock_key) == lock_key[2]
+                if (self._fired.get(lock_key) == lock_key[1]
                         and self.locker.lock_active
-                        and self._fired.get(unlock_key) != unlock_key[2]):
-                    self._fired[unlock_key] = unlock_key[2]
+                        and self._fired.get(unlock_key) != unlock_key[1]):
+                    self._fired[unlock_key] = unlock_key[1]
                     self._do_unlock(t)
                 continue
             if lock_due:
-                if not self.locker.lock_active and self._fired.get(lock_key) != lock_key[2]:
-                    self._fired[lock_key] = lock_key[2]
+                if not self.locker.lock_active and self._fired.get(lock_key) != lock_key[1]:
+                    self._fired[lock_key] = lock_key[1]
                     self._do_lock(t)
                     return
             if unlock_due:
-                if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[2]:
-                    self._fired[unlock_key] = unlock_key[2]
+                if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[1]:
+                    self._fired[unlock_key] = unlock_key[1]
                     self._do_unlock(t)
                     return
 
