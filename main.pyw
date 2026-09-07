@@ -476,6 +476,10 @@ class ScheduleWatcher:
         self.command_file = command_file
         self.ack_file = ack_file
         self._fired = {}  # (action, idx, date) -> date，防同一天重复触发
+        # 记忆解锁：once 计划锁定时记下属主的解锁时刻。即便属主随后被 aide
+        # 清理/改写（解锁丢失），到点也要放掉当前锁——否则永久卡死。
+        self._locked_owner = None      # (lock_key, unlock_key)，创建当前锁的计划
+        self._locked_unlock_at = None  # 属主 unlock.at 解析出的 datetime
         self._stop = False
 
     def _plan_path(self):
@@ -491,9 +495,19 @@ class ScheduleWatcher:
                 tasks = json.load(f)
             if isinstance(tasks, dict):
                 tasks = [tasks]
-            return tasks if isinstance(tasks, list) else []
+            if not isinstance(tasks, list):
+                return []
+            # 跳过非 dict 项（损坏数据）：一个坏项不得让整个检查报废。
+            return [t for t in tasks if isinstance(t, dict)]
         except Exception:
             return []
+
+    def _parse_at(self, at_str):
+        """once 的 at 解析成本地可比较的 datetime；失败返回 None（回退文件式解锁）。"""
+        try:
+            return datetime.datetime.fromisoformat(at_str)
+        except Exception:
+            return None
 
     def _match(self, when, mode, now):
         """when 条件是否命中。"""
@@ -529,10 +543,26 @@ class ScheduleWatcher:
         return ok
 
     def _check_plan(self, now):
+        # 记忆解锁：当前锁到点即放，与计划文件是否被改写/清理无关。
+        if not self.locker.lock_active:
+            self._locked_owner = None
+            self._locked_unlock_at = None
+        elif self._locked_unlock_at is not None:
+            ua = self._locked_unlock_at
+            if ua <= (now.astimezone() if ua.tzinfo else now):
+                # 只有真解开才清记忆/记 fired；失败留到下一秒重试（防卡死）。
+                if self._do_unlock({}):
+                    if self._locked_owner is not None:
+                        uk = self._locked_owner[1]
+                        self._fired[uk] = uk[1]
+                    self._locked_owner = None
+                    self._locked_unlock_at = None
+                return
         for i, t in enumerate(self._load_tasks()):
             mode = t.get("mode")
-            when = t.get("when") or {}
-            unlock = t.get("unlock") or {}
+            # when/unlock 非 dict（损坏数据）按空处理：该任务不触发，但不崩溃。
+            when = t.get("when") if isinstance(t.get("when"), dict) else {}
+            unlock = t.get("unlock") if isinstance(t.get("unlock"), dict) else {}
             today = now.strftime("%Y-%m-%d")
             # once 任务用 at 做防重 key（不用数组下标——aide 每次写计划会
             # append/清理，下标会漂移导致本进程“锁过这条”的标记失效）；
@@ -547,21 +577,29 @@ class ScheduleWatcher:
             unlock_due = self._match(unlock, mode, now)
             if mode == "once" and unlock_due:
                 # 过期 once 不再上锁；只有本进程锁过这条才解锁，避免误解后面那条。
+                # 解锁成功才记 fired——失败留下一秒重试，否则一次抖动就永久卡死。
                 if (self._fired.get(lock_key) == lock_key[1]
                         and self.locker.lock_active
-                        and self._fired.get(unlock_key) != unlock_key[1]):
+                        and self._fired.get(unlock_key) != unlock_key[1]
+                        and self._do_unlock(t)):
                     self._fired[unlock_key] = unlock_key[1]
-                    self._do_unlock(t)
                 continue
             if lock_due:
+                # 只有真锁上才记 fired；失败不记，下一秒重试（grab 被别的程序
+                # 短暂占用不该让这次休息永久跳过）。
                 if not self.locker.lock_active and self._fired.get(lock_key) != lock_key[1]:
-                    self._fired[lock_key] = lock_key[1]
-                    self._do_lock(t)
+                    if self._do_lock(t):
+                        self._fired[lock_key] = lock_key[1]
+                        if mode == "once":
+                            # 记下属主解锁时刻，供记忆解锁（属主被清理也能到点放锁）。
+                            self._locked_owner = (lock_key, unlock_key)
+                            self._locked_unlock_at = self._parse_at(unlock.get("at"))
                     return
             if unlock_due:
-                if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[1]:
+                if (self.locker.lock_active
+                        and self._fired.get(unlock_key) != unlock_key[1]
+                        and self._do_unlock(t)):
                     self._fired[unlock_key] = unlock_key[1]
-                    self._do_unlock(t)
                     return
 
     def _check_command(self):
