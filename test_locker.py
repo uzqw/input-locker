@@ -96,6 +96,26 @@ class LockerTests(unittest.TestCase):
         self.locker._open_devices.assert_not_called()
         self.assertEqual(self.inhibitors, [])
 
+    def test_later_once_still_runs_after_earlier_once_unlocks(self):
+        now = datetime.datetime.fromisoformat('2026-09-05T10:05:00+08:00')
+        self.plan.write_text(json.dumps([
+            dict(mode='once', when=dict(at='2026-09-05T10:05:00+08:00'),
+                 unlock=dict(at='2026-09-05T10:15:00+08:00')),
+            dict(mode='once', when=dict(at='2026-09-05T11:05:00+08:00'),
+                 unlock=dict(at='2026-09-05T11:20:00+08:00'))]))
+        # 第一条锁定
+        self.watcher._check_plan(now)
+        self.assertTrue(self.locker.lock_active)
+        # 第一条解锁
+        self.watcher._check_plan(now + datetime.timedelta(minutes=10))
+        self.assertFalse(self.locker.lock_active)
+        # 第二条锁定（bug 下被第一条过期 once 的 return squash，永不触发）
+        self.watcher._check_plan(now + datetime.timedelta(hours=1))
+        self.assertTrue(self.locker.lock_active)
+        # 第二条解锁
+        self.watcher._check_plan(now + datetime.timedelta(hours=1, minutes=15))
+        self.assertFalse(self.locker.lock_active)
+
     def test_concurrent_lock_calls_start_one_worker(self):
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda _: self.locker.start_lock(), range(16)))

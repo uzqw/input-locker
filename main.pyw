@@ -10,7 +10,17 @@ import datetime
 import subprocess
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
-from locker_lifecycle import serialized
+
+
+def serialized(method):
+    """Serialize public lock/unlock operations from the UI and schedule threads."""
+    from functools import wraps
+
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return call
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -514,11 +524,13 @@ class ScheduleWatcher:
             lock_due = self._match(when, mode, now)
             unlock_due = self._match(unlock, mode, now)
             if mode == "once" and unlock_due:
-                # 解锁时刻已过：过期 once 重启不再上锁，也不必先清空计划。
-                if self.locker.lock_active and self._fired.get(unlock_key) != unlock_key[2]:
+                # 过期 once 不再上锁；只有本进程锁过这条才解锁，避免误解后面那条。
+                if (self._fired.get(lock_key) == lock_key[2]
+                        and self.locker.lock_active
+                        and self._fired.get(unlock_key) != unlock_key[2]):
                     self._fired[unlock_key] = unlock_key[2]
                     self._do_unlock(t)
-                return
+                continue
             if lock_due:
                 if not self.locker.lock_active and self._fired.get(lock_key) != lock_key[2]:
                     self._fired[lock_key] = lock_key[2]
