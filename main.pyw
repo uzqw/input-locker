@@ -35,6 +35,19 @@ if IS_WINDOWS:
     import winreg
     user32 = ctypes.WinDLL('user32', use_last_error=True)
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    # 焦点相关函数显式声明 64 位 HWND/线程 id 类型，避免默认 c_int 截断
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    user32.SetForegroundWindow.restype = ctypes.c_bool
+    user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+    user32.BringWindowToTop.restype = ctypes.c_bool
+    user32.SetFocus.argtypes = [ctypes.c_void_p]
+    user32.SetFocus.restype = ctypes.c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+    user32.AttachThreadInput.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_bool]
+    user32.AttachThreadInput.restype = ctypes.c_bool
+    kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -258,8 +271,11 @@ class InputLocker:
                     ]
                     if len(self.caps_lock_press_times) >= CAPS_LOCK_TRIGGER_COUNT:
                         self.caps_lock_press_times.clear()
-                        self.unlock_mode = not self.unlock_mode
-                        self._unlock_mode_changed = True
+                        # sticky：只开不关（与 Linux 一致），避免连按 Caps 反复切换
+                        # 导致永远进不了输密码状态；关闭只走解锁/取消路径。
+                        if not self.unlock_mode:
+                            self.unlock_mode = True
+                            self._unlock_mode_changed = True
                     return 1
 
                 if self.unlock_mode:
@@ -989,19 +1005,44 @@ class LockApp:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
-        # mutter 下 Tk 的 deiconify/lift 不可靠（窗口仍 HIDDEN 或被全屏窗口盖住），
-        # 用 xdotool 强制激活置顶；无 xdotool 时静默回退。
-        try:
-            subprocess.run(
-                ["xdotool", "search", "--name", "Input Locker", "windowactivate"],
-                timeout=2, capture_output=True,
-            )
-        except Exception:
-            pass
+        if IS_WINDOWS:
+            # Windows 前台锁会拒绝 focus_force；用 AttachThreadInput + SetForegroundWindow
+            # 强制激活，再 SetFocus 到密码框。窗口/输入框可能未就绪，重试几次。
+            self._win_focus_entry()
+            self.root.after(150, self._win_focus_entry)
+            self.root.after(400, self._win_focus_entry)
+        else:
+            # mutter 下 Tk 的 deiconify/lift 不可靠（窗口仍 HIDDEN 或被全屏窗口盖住），
+            # 用 xdotool 强制激活置顶；无 xdotool 时静默回退。
+            try:
+                subprocess.run(
+                    ["xdotool", "search", "--name", "Input Locker", "windowactivate"],
+                    timeout=2, capture_output=True,
+                )
+            except Exception:
+                pass
         try:
             self.password_entry._entry.focus_set()
         except Exception:
             self.password_entry.focus_set()
+
+    def _win_focus_entry(self):
+        try:
+            hwnd = self.root.winfo_id()
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, None)
+            cur_thread = kernel32.GetCurrentThreadId()
+            attached = False
+            if fg_thread and fg_thread != cur_thread:
+                attached = user32.AttachThreadInput(cur_thread, fg_thread, True)
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            if attached:
+                user32.AttachThreadInput(cur_thread, fg_thread, False)
+            entry_hwnd = self.password_entry._entry.winfo_id()
+            user32.SetFocus(entry_hwnd)
+        except Exception:
+            pass
 
     def lock(self):
         success = self.locker.start_lock()
