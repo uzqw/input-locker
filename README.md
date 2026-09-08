@@ -78,7 +78,7 @@ aide 的 rest-break 使用 `input-locker-events/` 目录与本程序通信：
 - 所有事件不可变，使用唯一临时文件写完后原子替换；
 - 会话由稳定 `sessionId` 关联，进程重启后从事件重建，不依赖内存任务下标；
 - 密码提前解锁记录 `reason=password`，rest-break 只按实际锁定区间计算休息；
-- 默认必须锁定满 180 秒才能使用密码解锁，管理员 command 可绕过该限制。
+- 密码和管理员 command 都可以随时解锁；解锁原因会写入事件，实际锁定时长由事件投影计算。
 
 事件目录默认与计划文件同目录，也可用 `INPUT_LOCKER_EVENTS_DIR` 覆盖。
 

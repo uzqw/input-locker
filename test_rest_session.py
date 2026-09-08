@@ -42,7 +42,7 @@ class RestSessionTests(unittest.TestCase):
         self.locker = FakeLocker()
         self.controller = RestSessionController(self.locker, self.tmp.name, clock=lambda: self.base)
 
-    def request(self, sid="s1", start=0, duration=10, minimum=180):
+    def request(self, sid="s1", start=0, duration=10, minimum=0):
         self.store.emit(self.store.requests, sid, "rest.requested", {
             "lockAt": iso(self.base + datetime.timedelta(minutes=start)),
             "unlockAt": iso(self.base + datetime.timedelta(minutes=start + duration)),
@@ -61,14 +61,14 @@ class RestSessionTests(unittest.TestCase):
         self.assertEqual(session.segments[0].reason, "scheduled")
         self.assertEqual((session.segments[0].unlocked_at - session.segments[0].locked_at).total_seconds(), 600)
 
-    def test_password_unlock_before_minimum_is_rejected_without_event(self):
+    def test_password_unlock_is_allowed_immediately(self):
         self.request()
         self.controller.tick(self.base)
-        ok, message = self.controller.unlock("password", self.base + datetime.timedelta(minutes=2))
-        self.assertFalse(ok)
-        self.assertIn("继续休息", message)
-        self.assertTrue(self.locker.lock_active)
-        self.assertEqual(len(self.store._read_dir(self.store.results)), 1)
+        ok, message = self.controller.unlock("password", self.base + datetime.timedelta(seconds=1))
+        self.assertTrue(ok)
+        self.assertEqual(message, "ok")
+        self.assertFalse(self.locker.lock_active)
+        self.assertEqual(project(self.store.events(), self.base)["s1"].phase, "ended")
 
     def test_password_unlock_after_three_minutes_is_terminal(self):
         self.request()

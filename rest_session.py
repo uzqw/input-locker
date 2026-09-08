@@ -79,7 +79,9 @@ class Session:
     unlock_at: datetime
     source: str = "rest-break"
     reason: str = ""
-    min_unlock_seconds: int = 180
+    # Kept in the event shape for replaying old requests; early unlock is
+    # intentionally always allowed.
+    min_unlock_seconds: int = 0
     phase: str = "waiting"
     segments: list[Segment] = field(default_factory=list)
     last_error: str = ""
@@ -162,7 +164,7 @@ def _request_from_event(event):
         unlock_at=unlock_at,
         source=data.get("source", "rest-break"),
         reason=data.get("reason", ""),
-        min_unlock_seconds=int(data.get("minUnlockSeconds", 180) or 0),
+        min_unlock_seconds=int(data.get("minUnlockSeconds", 0) or 0),
         updated_at=parse_time(event.get("recordedAt")),
     )
 
@@ -305,11 +307,6 @@ class RestSessionController:
             if not active:
                 return bool(self.locker.stop_lock()), "no_rest_session"
             session = active[0]
-            locked_at = session.segments[-1].locked_at if session.segments else now
-            earliest = locked_at + timedelta(seconds=session.min_unlock_seconds)
-            if reason == "password" and now < earliest:
-                remaining = max(1, int((earliest - now).total_seconds()))
-                return False, f"请继续休息 {remaining} 秒"
             if not self.locker.stop_lock():
                 return False, "解锁失败，请重试"
             self.store.emit_result(session.session_id, UNLOCKED, {
