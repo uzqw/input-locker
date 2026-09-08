@@ -10,6 +10,7 @@ import datetime
 import subprocess
 from tkinter import messagebox, filedialog
 import customtkinter as ctk
+from rest_session import RestSessionController
 
 
 def serialized(method):
@@ -469,13 +470,14 @@ class ScheduleWatcher:
     命令文件：{"cmd": "lock"|"unlock", "id": "唯一命令ID"}；ack 回传 id 与实际结果。
     旧命令可不带 id。先认领命令再执行，避免删除执行期间新到的命令。
     """
-    def __init__(self, locker, file_var, status_cb, command_file, ack_file):
+    def __init__(self, locker, file_var, status_cb, command_file, ack_file, rest_controller=None):
         self.locker = locker
         self.file_var = file_var
         self.status_cb = status_cb
         self.command_file = command_file
         self.ack_file = ack_file
-        self._fired = {}  # (action, idx, date) -> date，防同一天重复触发
+        self.rest_controller = rest_controller
+        self._fired = {}  # legacy plan compatibility only
         # 记忆解锁：once 计划锁定时记下属主的解锁时刻。即便属主随后被 aide
         # 清理/改写（解锁丢失），到点也要放掉当前锁——否则永久卡死。
         self._locked_owner = None      # (lock_key, unlock_key)，创建当前锁的计划
@@ -628,9 +630,14 @@ class ScheduleWatcher:
                 raise ValueError("命令必须是 JSON 对象")
             action = cmd.get("cmd")
             if action == "lock":
-                ok = self._do_lock(cmd)
+                ok = (self.rest_controller.manual_lock()
+                      if self.rest_controller is not None else self._do_lock(cmd))
             elif action == "unlock":
-                ok = self._do_unlock(cmd)
+                if self.rest_controller is not None:
+                    ok, message = self.rest_controller.unlock("command")
+                    self.status_cb(message, ok)
+                else:
+                    ok = self._do_unlock(cmd)
             else:
                 raise ValueError("bad cmd: " + str(action))
             if ok:
@@ -658,8 +665,15 @@ class ScheduleWatcher:
     def run(self):
         while not self._stop:
             try:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                if self.rest_controller is not None:
+                    self.rest_controller.tick(now)
                 self._check_command()
-                self._check_plan(datetime.datetime.now())
+                # The live application consumes only the event-sourced session
+                # stream. ScheduleWatcher._check_plan remains a compatibility
+                # adapter for its isolated legacy tests/callers.
+                if self.rest_controller is None:
+                    self._check_plan(datetime.datetime.now())
             except Exception:
                 pass
             time.sleep(1)
@@ -689,6 +703,7 @@ class LockApp:
         self.locker = locker
         self._last_unlock_mode = False
         self.wayland_fallback = wayland_fallback
+        self.rest_controller = None
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("dark-blue")
@@ -728,7 +743,7 @@ class LockApp:
         self.schedule_frame.pack(fill="x", pady=(8, 0))
 
         ctk.CTkLabel(
-            self.schedule_frame, text="计划文件（LLM 通过接口写入，自动生效）",
+            self.schedule_frame, text="休息事件目录（aide 通过事件协议写入）",
             font=ctk.CTkFont(size=12), text_color=self.SUBTEXT, anchor="w"
         ).pack(fill="x", padx=16, pady=(12, 4))
 
@@ -755,9 +770,16 @@ class LockApp:
         command_file = os.path.join(plan_dir, "input-locker-command.json") if plan_dir else ""
         ack_file = os.path.join(plan_dir, "input-locker-ack.json") if plan_dir else ""
 
+        events_dir = os.environ.get("INPUT_LOCKER_EVENTS_DIR") or os.path.join(
+            plan_dir or os.path.dirname(DEFAULT_PLAN_FILE), "input-locker-events"
+        )
+        self.schedule_path.configure(text=events_dir)
+        self.rest_controller = RestSessionController(
+            self.locker, events_dir, self._schedule_status
+        )
         self.watcher = ScheduleWatcher(
             self.locker, self.schedule_file_var, self._schedule_status,
-            command_file, ack_file
+            command_file, ack_file, self.rest_controller
         )
         self._watch_thread = threading.Thread(target=self.watcher.run, daemon=True)
         self._watch_thread.start()
@@ -1089,7 +1111,8 @@ class LockApp:
             pass
 
     def lock(self):
-        success = self.locker.start_lock()
+        success = (self.rest_controller.manual_lock()
+                   if self.rest_controller is not None else self.locker.start_lock())
         if success:
             self.status_label.configure(text="已锁定", text_color=self.RED)
             self.lock_button.configure(state="disabled", fg_color="#c7c7cc")
@@ -1112,17 +1135,24 @@ class LockApp:
         if password is None:
             password = self.password_entry.get()
         if password == self.locker.unlock_password:
-            if self.locker.stop_lock():
-                self.status_label.configure(text="未锁定", text_color=self.GREEN)
-                self.lock_button.configure(state="normal", fg_color=self.ACCENT)
-                self.change_pw_button.configure(state="normal")
-                self.root.attributes('-topmost', False)
-                self.root.attributes('-fullscreen', False)
-                self.unlock_frame.pack_forget()
-                self._last_unlock_mode = False
-                self.msg_label.configure(text="已成功解锁", text_color=self.GREEN)
+            if self.rest_controller is not None:
+                ok, message = self.rest_controller.unlock("password")
+                if not ok:
+                    self.msg_label.configure(text=message, text_color=self.RED)
+                    return
             else:
-                self.msg_label.configure(text="解锁失败，请重试", text_color=self.RED)
+                ok = self.locker.stop_lock()
+                if not ok:
+                    self.msg_label.configure(text="解锁失败，请重试", text_color=self.RED)
+                    return
+            self.status_label.configure(text="未锁定", text_color=self.GREEN)
+            self.lock_button.configure(state="normal", fg_color=self.ACCENT)
+            self.change_pw_button.configure(state="normal")
+            self.root.attributes('-topmost', False)
+            self.root.attributes('-fullscreen', False)
+            self.unlock_frame.pack_forget()
+            self._last_unlock_mode = False
+            self.msg_label.configure(text="已成功解锁", text_color=self.GREEN)
         else:
             self.locker.cancel_unlock_mode()
             self.unlock_frame.pack_forget()

@@ -68,6 +68,20 @@ systemctl --user enable --now input-locker.service
 
 未授权时锁定会失败。若把 CapsLock 改成了别的键，解锁不会触发。
 
+## 休息会话事件协议
+
+aide 的 rest-break 使用 `input-locker-events/` 目录与本程序通信：
+
+- `requests/*.json` 由 aide 发布 `rest.requested`，只表示锁定意图；
+- `results/*.json` 由 InputLocker 发布 `rest.locked`、`rest.observed`、
+  `rest.unlocked`、`rest.failed` 等事实；
+- 所有事件不可变，使用唯一临时文件写完后原子替换；
+- 会话由稳定 `sessionId` 关联，进程重启后从事件重建，不依赖内存任务下标；
+- 密码提前解锁记录 `reason=password`，rest-break 只按实际锁定区间计算休息；
+- 默认必须锁定满 180 秒才能使用密码解锁，管理员 command 可绕过该限制。
+
+事件目录默认与计划文件同目录，也可用 `INPUT_LOCKER_EVENTS_DIR` 覆盖。
+
 ## 注意
 
 - 面向笔记本自带键盘；USB 禁用只拦 U 盘，不拦内置键盘 / 触控板。
