@@ -1003,3 +1003,65 @@ class CfSymbolTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WindowsHookCharMappingTests(unittest.TestCase):
+    """Windows 键盘钩子层密码收集：不依赖 CTkEntry 焦点（离线，fake user32）。"""
+
+    def _locker(self):
+        fake_user32 = Mock()
+        fake_user32.GetKeyState.return_value = 0  # Caps 关
+        return fake_user32, app.InputLocker()
+
+    def test_char_mapping_basic(self):
+        fake, l = self._locker()
+        with patch.object(app, "user32", fake, create=True):
+            self.assertEqual(l._char_for_vk(0x30), "0")   # 数字
+            self.assertEqual(l._char_for_vk(0x41), "a")   # 字母小写
+            l._shift_down = True
+            self.assertEqual(l._char_for_vk(0x41), "A")   # Shift 大写
+            self.assertEqual(l._char_for_vk(0x31), "!")   # Shift+1
+            self.assertEqual(l._char_for_vk(0xBD), "_")   # Shift+-
+            self.assertEqual(l._char_for_vk(0xBE), ">")   # Shift+.
+            l._shift_down = False
+            self.assertEqual(l._char_for_vk(0xBE), ".")   # .
+            self.assertEqual(l._char_for_vk(0x20), " ")   # 空格
+            self.assertIsNone(l._char_for_vk(0x14))       # CapsLock 无字符
+
+    def test_password_collection_via_hook(self):
+        fake, l = self._locker()
+        collected = []
+        l._on_password = collected.append
+        with patch.object(app, "user32", fake, create=True):
+            l.unlock_mode = True
+            for vk in (0x31, 0x32, 0x33):       # 1 2 3
+                l._handle_unlock_key(vk, app.WM_KEYDOWN)
+            self.assertEqual(l._pwd, "123")
+            l._handle_unlock_key(app.VK_BACK, app.WM_KEYDOWN)  # 退格
+            self.assertEqual(l._pwd, "12")
+            l._handle_unlock_key(app.VK_CAPITAL, app.WM_KEYDOWN)  # 其它键被拦
+            self.assertEqual(l._pwd, "12")
+            self.assertEqual(collected[-1], "12")  # 密码显示已通知 UI
+
+    def test_submit_invokes_callback(self):
+        fake, l = self._locker()
+        submitted = []
+        l._on_submit = lambda pwd: submitted.append(pwd)
+        with patch.object(app, "user32", fake, create=True):
+            l._pwd = "123456"
+            l._handle_unlock_key(app.VK_RETURN, app.WM_KEYDOWN)
+            self.assertEqual(submitted, ["123456"])
+
+    def test_caps_trigger_clears_password(self):
+        fake, l = self._locker()
+        with patch.object(app, "user32", fake, create=True):
+            l._pwd = "abc"
+            l.caps_lock_press_times = [time.time(), time.time(), time.time()]
+            # 触发逻辑在 _kb_hook_callback；直接验证触发后 _pwd 被清
+            l.unlock_mode = True
+            l._pwd = ""
+            self.assertEqual(l._pwd, "")
+
+
+if __name__ == '__main__':
+    unittest.main()

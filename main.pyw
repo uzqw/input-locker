@@ -68,9 +68,6 @@ VK_RETURN = 0x0D
 VK_SHIFT = 0x10
 CURSOR_SHOWING = 0x00000001
 
-LETTER_KEYS = set(range(0x41, 0x5B))
-NUMBER_KEYS = set(range(0x30, 0x3A))
-
 CAPS_LOCK_TRIGGER_COUNT = 3
 CAPS_LOCK_TRIGGER_WINDOW = 2.0
 
@@ -180,6 +177,11 @@ class InputLocker:
         self.caps_lock_press_times = []
         self.unlock_mode = False
         self._unlock_mode_changed = False
+        # 钩子层密码收集（与 Linux 抓取层一致）：不依赖 CTkEntry 焦点。
+        self._pwd = ""
+        self._on_password = None
+        self._on_submit = None
+        self._shift_down = False
 
         self._original_screensaver_active = None
         self._original_screensaver_timeout = None
@@ -190,6 +192,10 @@ class InputLocker:
         cfg = load_config()
         cfg["password"] = new_password
         save_config(cfg)
+
+    def set_ui_callbacks(self, on_password=None, on_submit=None):
+        self._on_password = on_password
+        self._on_submit = on_submit
 
     def _get_screensaver_settings(self):
         try:
@@ -276,17 +282,14 @@ class InputLocker:
                         # 导致永远进不了输密码状态；关闭只走解锁/取消路径。
                         if not self.unlock_mode:
                             self.unlock_mode = True
+                            self._pwd = ""
                             self._unlock_mode_changed = True
                     return 1
 
                 if self.unlock_mode:
-                    allowed = LETTER_KEYS | NUMBER_KEYS | {VK_BACK, VK_RETURN, VK_SHIFT}
-                    if vk_code in allowed:
-                        return user32.CallNextHookEx(
-                            self.kb_hook_handle, nCode, wParam,
-                            ctypes.cast(lParam, ctypes.POINTER(ctypes.c_void_p))
-                        )
-                    return 1
+                    # 解锁模式：直接在钩子层解析密码（与 Linux 抓取层一致），
+                    # 不依赖 CTkEntry 焦点——密码框抢不到焦点也能输密码解锁。
+                    return self._handle_unlock_key(vk_code, wParam)
 
                 return 1
 
@@ -297,6 +300,65 @@ class InputLocker:
             self.kb_hook_handle, nCode, wParam,
             ctypes.cast(lParam, ctypes.POINTER(ctypes.c_void_p))
         )
+
+    def _handle_unlock_key(self, vk_code, wParam):
+        """解锁模式按键：收集密码字符到 _pwd，不经系统焦点。"""
+        if vk_code == VK_SHIFT:
+            if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                self._shift_down = True
+            elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                self._shift_down = False
+            return 1
+        if wParam in (WM_KEYUP, WM_SYSKEYUP):
+            return 1  # 只处理按下
+        if vk_code == VK_BACK:
+            if self._pwd:
+                self._pwd = self._pwd[:-1]
+                self._notify_password()
+            return 1
+        if vk_code == VK_RETURN:
+            self._submit()
+            return 1
+        ch = self._char_for_vk(vk_code)
+        if ch is not None:
+            self._pwd += ch
+            self._notify_password()
+        return 1
+
+    def _char_for_vk(self, vk_code):
+        """把主键盘区虚拟键码映射为字符（含 Shift/Caps 大小写与符号）。"""
+        if 0x41 <= vk_code <= 0x5A:  # A-Z
+            ch = chr(vk_code)
+            caps_on = bool(user32.GetKeyState(VK_CAPITAL) & 1)
+            upper = self._shift_down ^ caps_on
+            return ch if upper else ch.lower()
+        if 0x30 <= vk_code <= 0x39:  # 0-9（Shift 符号）
+            digits = "0123456789"
+            syms = ")!@#$%^&*("
+            i = vk_code - 0x30
+            return syms[i] if self._shift_down else digits[i]
+        if vk_code == 0x20:  # 空格
+            return " "
+        table = {  # 主键盘区符号键: (无 Shift, Shift)
+            0xBD: ("-", "_"), 0xBB: ("=", "+"),
+            0xDB: ("[", "{"), 0xDD: ("]", "}"),
+            0xDC: ("\\", "|"), 0xBA: (";", ":"),
+            0xDE: ("'", '"'), 0xBC: (",", "<"),
+            0xBE: (".", ">"), 0xBF: ("/", "?"),
+            0xC0: ("`", "~"),
+        }
+        if vk_code in table:
+            base, shifted = table[vk_code]
+            return shifted if self._shift_down else base
+        return None
+
+    def _notify_password(self):
+        if self._on_password:
+            self._on_password(self._pwd)
+
+    def _submit(self):
+        if self._on_submit:
+            self._on_submit(self._pwd)
 
     def _mouse_hook_callback(self, nCode, wParam, lParam):
         if nCode >= 0 and self.lock_active:
@@ -386,6 +448,8 @@ class InputLocker:
             self.unlock_mode = False
             self._unlock_mode_changed = False
             self.caps_lock_press_times.clear()
+            self._pwd = ""
+            self._shift_down = False
 
             self._lock_ready.clear()
             self._lock_error = None
@@ -735,7 +799,10 @@ class LockApp:
         self.password_entry.insert(0, pwd)
 
     def _linux_submit_cb(self, pwd):
-        self.root.after(0, lambda: self.unlock(pwd))
+        # 解锁在调用线程（钩子线程）直接执行，不依赖 UI 线程——即使 UI 卡死，
+        # 正确密码也能解锁（写 rest.unlocked 事件 + stop_lock）。UI 状态更新投递回 UI 线程。
+        ok, message = self._try_unlock(pwd)
+        self.root.after(0, lambda: self._after_unlock_result(ok, message))
 
     def _build_schedule_ui(self, container):
         schedule_cfg = load_config().get("schedule_file") or DEFAULT_PLAN_FILE or ""
@@ -1131,20 +1198,18 @@ class LockApp:
         else:
             self.msg_label.configure(text="锁定失败!", text_color=self.RED)
 
-    def unlock(self, password=None):
-        if password is None:
-            password = self.password_entry.get()
-        if password == self.locker.unlock_password:
-            if self.rest_controller is not None:
-                ok, message = self.rest_controller.unlock("password")
-                if not ok:
-                    self.msg_label.configure(text=message, text_color=self.RED)
-                    return
-            else:
-                ok = self.locker.stop_lock()
-                if not ok:
-                    self.msg_label.configure(text="解锁失败，请重试", text_color=self.RED)
-                    return
+    def _try_unlock(self, password):
+        """密码校验 + 实际解锁，纯逻辑（任意线程可调）。返回 (ok, message)。"""
+        if password != self.locker.unlock_password:
+            return False, "wrong_password"
+        if self.rest_controller is not None:
+            return self.rest_controller.unlock("password")
+        ok = self.locker.stop_lock()
+        return ok, ("" if ok else "解锁失败，请重试")
+
+    def _after_unlock_result(self, ok, message):
+        """UI 线程：按解锁结果刷新界面。"""
+        if ok:
             self.status_label.configure(text="未锁定", text_color=self.GREEN)
             self.lock_button.configure(state="normal", fg_color=self.ACCENT)
             self.change_pw_button.configure(state="normal")
@@ -1153,13 +1218,21 @@ class LockApp:
             self.unlock_frame.pack_forget()
             self._last_unlock_mode = False
             self.msg_label.configure(text="已成功解锁", text_color=self.GREEN)
-        else:
+        elif message == "wrong_password":
             self.locker.cancel_unlock_mode()
             self.unlock_frame.pack_forget()
             self._last_unlock_mode = False
             self.password_entry.delete(0, 'end')
             self.root.attributes('-fullscreen', False)
             self.msg_label.configure(text="密码错误 — 连按3次 CapsLock 重新解锁", text_color=self.RED)
+        else:
+            self.msg_label.configure(text=message or "解锁失败，请重试", text_color=self.RED)
+
+    def unlock(self, password=None):
+        if password is None:
+            password = self.password_entry.get()
+        ok, message = self._try_unlock(password)
+        self._after_unlock_result(ok, message)
 
     def on_close(self):
         # Wayland 下系统锁屏才是真正的锁，关闭本程序不会解锁系统，允许关闭
