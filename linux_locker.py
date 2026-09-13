@@ -27,6 +27,7 @@ from locker_lifecycle import serialized
 
 from Xlib import X, display
 from Xlib.ext import xfixes
+from Xlib.ext import xtest
 
 try:
     import evdev
@@ -487,6 +488,7 @@ class EvdevLocker:
         self._shifted = False
         self._state_lock = threading.RLock()
         self._devs = {}          # path -> InputDevice
+        self._held_keys = {}     # path -> {evdev code}，抓取期间按下未释放的键
         self._grab_error = None  # 权限/抓取失败原因（触发回退）
         self.usb_storage_skipped = False
 
@@ -593,6 +595,7 @@ class EvdevLocker:
                     % (path, e)) from e
         if not grabbed:
             raise RuntimeError("未找到可抓取的输入设备")
+        self._held_keys.clear()
         return grabbed
 
     def _worker(self):
@@ -620,6 +623,21 @@ class EvdevLocker:
                 except Exception:
                     pass
             self._devs.clear()
+            # 抓取期间按住未弹起的键，其 release 被 grab 吞掉，X 侧会认为键仍按住
+            # （表现：解锁后该键一直触发）。补发 release 再清表。
+            held = [c for codes in self._held_keys.values() for c in codes]
+            self._held_keys.clear()
+            if held:
+                try:
+                    d = display.Display()
+                    try:
+                        for code in held:
+                            xtest.fake_input(d, X.KeyRelease, code + _X11_KEYCODE_OFFSET)
+                        d.sync()
+                    finally:
+                        d.close()
+                except Exception:
+                    pass
             _stop_inhibit(self._inhibit)
             self._inhibit = None
             _usb_storage(True, self._usb_lock, self)
@@ -635,6 +653,11 @@ class EvdevLocker:
             try:
                 for e in dev.read():
                     if e.type == ecodes.EV_KEY:
+                        held = self._held_keys.setdefault(dev.path, set())
+                        if e.value == 1:
+                            held.add(e.code)
+                        elif e.value == 0:
+                            held.discard(e.code)
                         self._on_key(e.code, e.value)
             except OSError:
                 self._drop_dev(dev)  # 设备拔出
@@ -689,6 +712,7 @@ class EvdevLocker:
                 except Exception:
                     pass
                 del self._devs[p]
+                self._held_keys.pop(p, None)
                 return
 
     def _scan_new(self):
@@ -707,6 +731,7 @@ class EvdevLocker:
                     continue
                 dev.grab()
                 self._devs[path] = dev
+                self._held_keys[path] = set()
             except Exception:
                 try:
                     dev.close()
